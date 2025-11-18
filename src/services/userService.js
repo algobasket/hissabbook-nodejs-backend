@@ -17,6 +17,29 @@ async function getUserRoles(pool, userId) {
   return result.rows.map((row) => row.name);
 }
 
+async function getUserPermissions(pool, userId) {
+  const result = await pool.query(
+    `SELECT DISTINCT p.code, p.name, p.category
+     FROM public.user_roles ur
+     JOIN public.role_permissions rp ON ur.role_id = rp.role_id
+     JOIN public.permissions p ON rp.permission_id = p.id
+     WHERE ur.user_id = $1`,
+    [userId],
+  );
+  return result.rows.map((row) => row.code);
+}
+
+async function hasPermission(pool, userId, permissionCode) {
+  // Admin always has all permissions
+  const roles = await getUserRoles(pool, userId);
+  if (roles.includes('admin')) {
+    return true;
+  }
+
+  const permissions = await getUserPermissions(pool, userId);
+  return permissions.includes(permissionCode);
+}
+
 async function createUser(pool, { email, password, firstName, lastName }) {
   const id = uuidv4();
   const passwordHash = await hashPassword(password);
@@ -44,5 +67,7 @@ module.exports = {
   findUserByEmail,
   createUser,
   getUserRoles,
+  getUserPermissions,
+  hasPermission,
 };
 

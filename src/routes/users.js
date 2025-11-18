@@ -108,12 +108,13 @@ async function usersRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user is admin
+      // Check if user is admin or manager
       const roles = await getUserRoles(app.pg, user.id);
       const isAdmin = roles.includes('admin');
+      const isManager = roles.includes('managers') || roles.includes('manager');
 
-      if (!isAdmin) {
-        return reply.code(403).send({ message: 'Access denied. Admin role required.' });
+      if (!isAdmin && !isManager) {
+        return reply.code(403).send({ message: 'Access denied. Admin or Manager role required.' });
       }
 
       const query = `

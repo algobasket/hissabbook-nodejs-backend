@@ -1,6 +1,8 @@
 const fastify = require('fastify');
 const cors = require('@fastify/cors');
 const jwt = require('@fastify/jwt');
+const fs = require('fs/promises');
+const path = require('path');
 const registerDatabase = require('./plugins/db');
 const authRoutes = require('./routes/auth');
 const payoutRequestRoutes = require('./routes/payoutRequests');
@@ -11,6 +13,8 @@ const transactionsRoutes = require('./routes/transactions');
 const booksRoutes = require('./routes/books');
 const dashboardRoutes = require('./routes/dashboard');
 const businessesRoutes = require('./routes/businesses');
+const permissionsRoutes = require('./routes/permissions');
+const invitesRoutes = require('./routes/invites');
 
 async function buildApp() {
   const app = fastify({
@@ -19,6 +23,8 @@ async function buildApp() {
 
   await app.register(cors, {
     origin: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
   });
 
   if (!process.env.JWT_SECRET) {
@@ -44,6 +50,42 @@ async function buildApp() {
 
   app.get('/health', async () => ({ status: 'ok' }));
 
+  // Serve uploaded files
+  app.get('/uploads/:filename', async (request, reply) => {
+    const { filename } = request.params;
+
+    // Security: prevent directory traversal
+    if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+      return reply.code(400).send({ message: 'Invalid filename' });
+    }
+
+    try {
+      const filePath = path.join(process.cwd(), 'uploads', filename);
+      const fileBuffer = await fs.readFile(filePath);
+
+      // Determine content type based on file extension
+      const ext = path.extname(filename).toLowerCase();
+      const contentTypeMap = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.pdf': 'application/pdf',
+      };
+      const contentType = contentTypeMap[ext] || 'application/octet-stream';
+
+      reply.type(contentType);
+      return reply.send(fileBuffer);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return reply.code(404).send({ message: 'File not found' });
+      }
+      request.log.error({ err: error }, 'Failed to serve file');
+      return reply.code(500).send({ message: 'Failed to serve file' });
+    }
+  });
+
   await app.register(authRoutes, { prefix: '/api/auth' });
   await app.register(payoutRequestRoutes, { prefix: '/api/payout-requests' });
   await app.register(rolesRoutes, { prefix: '/api' });
@@ -53,6 +95,8 @@ async function buildApp() {
   await app.register(booksRoutes, { prefix: '/api' });
   await app.register(dashboardRoutes, { prefix: '/api' });
   await app.register(businessesRoutes, { prefix: '/api' });
+  await app.register(permissionsRoutes, { prefix: '/api' });
+  await app.register(invitesRoutes, { prefix: '/api' });
 
   return app;
 }
