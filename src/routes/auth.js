@@ -1,5 +1,6 @@
-const { verifyPassword } = require('../utils/password');
-const { findUserByEmail, createUser, getUserRoles } = require('../services/userService');
+const { verifyPassword, hashPassword } = require('../utils/password');
+const { findUserByEmail, createUser, getUserRoles, getUserDetails, updateUserDetails } = require('../services/userService');
+const { saveImageToDisk, deleteImageFromDisk } = require('../utils/fileUpload');
 
 async function authRoutes(app) {
   app.post('/register', {
@@ -111,6 +112,275 @@ async function authRoutes(app) {
         lastLoginAt: user.last_login_at,
       },
     };
+  });
+
+  // Refresh token endpoint - generates a new token with extended expiration
+  app.post('/refresh-token', { preValidation: [app.authenticate] }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Get user roles
+      const roles = await getUserRoles(app.pg, user.id);
+      const primaryRole = roles[0] || null;
+
+      // Generate new token
+      const token = app.jwt.sign({
+        sub: user.id,
+        email: user.email,
+        status: user.status,
+        roles: roles,
+        role: primaryRole,
+      });
+
+      return reply.send({
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          status: user.status,
+          roles: roles,
+          role: primaryRole,
+        },
+      });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to refresh token');
+      return reply.code(500).send({ message: 'Failed to refresh token' });
+    }
+  });
+
+  // Get user account details
+  app.get('/account-details', { preValidation: [app.authenticate] }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      const userDetails = await getUserDetails(app.pg, user.id);
+      const roles = await getUserRoles(app.pg, user.id);
+      const primaryRole = roles[0] || 'managers';
+
+      if (!userDetails) {
+        return reply.send({
+          email: user.email,
+          name: null,
+          firstName: null,
+          lastName: null,
+          gstin: null,
+          phone: null,
+          upiId: null,
+          upiQrCode: null,
+          role: primaryRole,
+          roles: roles,
+        });
+      }
+
+      // Parse metadata if it's a string
+      let metadata = {};
+      if (userDetails.metadata) {
+        if (typeof userDetails.metadata === 'object') {
+          metadata = userDetails.metadata;
+        } else {
+          try {
+            metadata = typeof userDetails.metadata === 'string' ? JSON.parse(userDetails.metadata) : {};
+          } catch {
+            metadata = {};
+          }
+        }
+      }
+
+      const fullName = [userDetails.first_name, userDetails.last_name].filter(Boolean).join(' ').trim() || null;
+
+      return reply.send({
+        email: user.email,
+        name: fullName,
+        firstName: userDetails.first_name || null,
+        lastName: userDetails.last_name || null,
+        gstin: metadata.gstin || null,
+        phone: userDetails.phone || null,
+        upiId: userDetails.upi_id || null,
+        upiQrCode: userDetails.upi_qr_code || null,
+        role: primaryRole,
+        roles: roles,
+      });
+    } catch (error) {
+      request.log.error({ err: error, stack: error.stack }, 'Failed to fetch account details');
+      return reply.code(500).send({ 
+        message: 'Failed to fetch account details',
+        error: error.message 
+      });
+    }
+  });
+
+  // Update user account details
+  app.put('/account-details', {
+    preValidation: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          firstName: { type: 'string' },
+          lastName: { type: 'string' },
+          gstin: { type: 'string' },
+          phone: { type: 'string' },
+          upiId: { type: 'string' },
+          upiQrCode: { type: 'string' }, // Base64 image string
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      const { name, firstName, lastName, gstin, phone, upiId, upiQrCode } = request.body;
+
+      // Get existing details to check for old QR code
+      const existing = await getUserDetails(app.pg, user.id);
+      let qrCodeFilename = existing?.upi_qr_code || null;
+
+      // Handle QR code upload
+      if (upiQrCode !== undefined) {
+        try {
+          // If a new QR code is provided, save it
+          if (upiQrCode && upiQrCode.trim() !== '') {
+            // Delete old QR code if it exists
+            if (qrCodeFilename) {
+              await deleteImageFromDisk(qrCodeFilename);
+            }
+            // Save new QR code
+            qrCodeFilename = await saveImageToDisk(upiQrCode, 'qr-code');
+          } else if (upiQrCode === null || upiQrCode === '') {
+            // If QR code is explicitly set to empty, delete the old one
+            if (qrCodeFilename) {
+              await deleteImageFromDisk(qrCodeFilename);
+              qrCodeFilename = null;
+            }
+          }
+        } catch (error) {
+          request.log.error({ err: error }, 'Failed to save QR code image');
+          return reply.code(400).send({ message: `Failed to save QR code: ${error.message}` });
+        }
+      }
+
+      // If name is provided, split it into first and last name
+      let finalFirstName = firstName;
+      let finalLastName = lastName;
+
+      if (name && !firstName && !lastName) {
+        const nameParts = name.trim().split(/\s+/);
+        finalFirstName = nameParts[0] || null;
+        finalLastName = nameParts.slice(1).join(' ') || null;
+      }
+
+      const updatedDetails = await updateUserDetails(app.pg, user.id, {
+        firstName: finalFirstName,
+        lastName: finalLastName,
+        gstin,
+        phone,
+        upiId,
+        upiQrCode: qrCodeFilename,
+      });
+
+      if (!updatedDetails) {
+        return reply.code(500).send({ message: 'Failed to update account details' });
+      }
+
+      // Parse metadata if it's a string
+      let metadata = {};
+      if (updatedDetails.metadata) {
+        if (typeof updatedDetails.metadata === 'object') {
+          metadata = updatedDetails.metadata;
+        } else {
+          try {
+            metadata = typeof updatedDetails.metadata === 'string' ? JSON.parse(updatedDetails.metadata) : {};
+          } catch {
+            metadata = {};
+          }
+        }
+      }
+
+      const fullName = [updatedDetails.first_name, updatedDetails.last_name].filter(Boolean).join(' ').trim() || null;
+
+      // Get user roles
+      const roles = await getUserRoles(app.pg, user.id);
+      const primaryRole = roles[0] || 'managers';
+
+      return reply.send({
+        success: true,
+        accountDetails: {
+          email: user.email,
+          name: fullName,
+          firstName: updatedDetails.first_name || null,
+          lastName: updatedDetails.last_name || null,
+          gstin: metadata.gstin || null,
+          phone: updatedDetails.phone || null,
+          upiId: updatedDetails.upi_id || null,
+          upiQrCode: updatedDetails.upi_qr_code || null,
+          role: primaryRole,
+          roles: roles,
+        },
+      });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to update account details');
+      return reply.code(500).send({ message: 'Failed to update account details', error: error.message });
+    }
+  });
+
+  // Change password endpoint
+  app.put('/change-password', {
+    preValidation: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['currentPassword', 'newPassword'],
+        properties: {
+          currentPassword: { type: 'string', minLength: 1 },
+          newPassword: { type: 'string', minLength: 8 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      const { currentPassword, newPassword } = request.body;
+
+      // Verify current password
+      const isValid = await verifyPassword(currentPassword, user.password_hash);
+      if (!isValid) {
+        return reply.code(401).send({ message: 'Current password is incorrect' });
+      }
+
+      // Hash new password
+      const passwordHash = await hashPassword(newPassword);
+
+      // Update password
+      await app.pg.query(
+        'UPDATE public.users SET password_hash = $1, updated_at = now() WHERE id = $2',
+        [passwordHash, user.id]
+      );
+
+      return reply.send({
+        success: true,
+        message: 'Password changed successfully',
+      });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to change password');
+      return reply.code(500).send({
+        message: 'Failed to change password',
+        error: error.message,
+      });
+    }
   });
 }
 

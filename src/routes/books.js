@@ -85,6 +85,22 @@ async function booksRoutes(app) {
       const params = [];
       const conditions = [];
 
+      // For non-admin users, only show books they own or are members of
+      if (!isAdmin) {
+        const userIdParamIndex = params.length + 1;
+        conditions.push(`(
+          b.owner_user_id = $${userIdParamIndex} OR
+          EXISTS (
+            SELECT 1 FROM public.book_users bu 
+            WHERE bu.book_id = b.id AND bu.user_id = $${userIdParamIndex}
+          )
+        )`);
+        params.push(user.id);
+        request.log.info({ userId: user.id, email: user.email }, 'Filtering books for non-admin user');
+      } else {
+        request.log.info({ userId: user.id, email: user.email }, 'Admin user - showing all books');
+      }
+
       if (status && status !== 'all') {
         if (status === 'active') {
           // Active: has at least one transaction
@@ -1618,6 +1634,7 @@ async function booksRoutes(app) {
           b.created_at,
           b.updated_at,
           b.owner_user_id,
+          b.business_id,
           u.email as owner_email,
           ud.first_name as owner_first_name,
           ud.last_name as owner_last_name,
@@ -1661,6 +1678,7 @@ async function booksRoutes(app) {
         description: row.description || null,
         currencyCode: row.currency_code || 'INR',
         ownerId: row.owner_user_id,
+        businessId: row.business_id || null,
         ownerEmail: row.owner_email,
         ownerName: ownerFullName,
         ownerFirstName: row.owner_first_name || null,

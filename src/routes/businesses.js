@@ -489,6 +489,144 @@ async function businessesRoutes(app) {
     }
   });
 
+  // Get invites for a business
+  app.get('/businesses/:id/invites', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      const { id } = request.params;
+
+      // Check if business exists
+      const businessResult = await app.pg.query(
+        'SELECT id, name, owner_user_id FROM public.businesses WHERE id = $1',
+        [id]
+      );
+
+      if (businessResult.rows.length === 0) {
+        return reply.code(404).send({ message: 'Business not found' });
+      }
+
+      const business = businessResult.rows[0];
+
+      // Check if user has access to this business (must be owner or partner)
+      if (business.owner_user_id !== user.id) {
+        // Check if user is a partner (owner of a book in this business)
+        const partnerCheck = await app.pg.query(
+          'SELECT id FROM public.books WHERE business_id = $1 AND owner_user_id = $2 LIMIT 1',
+          [id, user.id]
+        );
+        
+        if (partnerCheck.rows.length === 0) {
+          return reply.code(403).send({ message: 'Access denied. You can only view invites for your own business or businesses where you are a partner.' });
+        }
+      }
+
+      // Check if invites table exists
+      const invitesTableCheck = await app.pg.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = 'business_invites'
+        );
+      `);
+
+      if (!invitesTableCheck.rows[0]?.exists) {
+        return reply.send({ invites: [] });
+      }
+
+      // Check if user_invites table exists
+      const userInvitesTableCheck = await app.pg.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = 'user_invites'
+        );
+      `);
+
+      const hasUserInvitesTable = userInvitesTableCheck.rows[0]?.exists;
+
+      // Get invites for this business with user acceptance status
+      let query = `
+        SELECT 
+          bi.id,
+          bi.business_id,
+          bi.email,
+          bi.phone,
+          bi.role,
+          bi.invite_token,
+          bi.status,
+          bi.invited_by,
+          inviter.email as inviter_email,
+          bi.expires_at,
+          bi.created_at,
+          bi.updated_at,
+          bi.accepted_at,
+          bi.accepted_by,
+          ui.user_id as accepted_user_id,
+          ui.status as user_invite_status,
+          ui.accepted_at as user_accepted_at,
+          u.email as accepted_user_email
+      `;
+
+      if (hasUserInvitesTable) {
+        query += `
+          FROM public.business_invites bi
+          LEFT JOIN public.users inviter ON bi.invited_by = inviter.id
+          LEFT JOIN public.user_invites ui ON bi.id = ui.business_invite_id
+          LEFT JOIN public.users u ON ui.user_id = u.id
+          WHERE bi.business_id = $1
+          ORDER BY bi.created_at DESC
+        `;
+      } else {
+        query += `
+          FROM public.business_invites bi
+          LEFT JOIN public.users inviter ON bi.invited_by = inviter.id
+          WHERE bi.business_id = $1
+          ORDER BY bi.created_at DESC
+        `;
+      }
+
+      const invitesResult = await app.pg.query(query, [id]);
+
+      const invites = invitesResult.rows.map((invite) => ({
+        id: invite.id,
+        businessId: invite.business_id,
+        email: invite.email,
+        phone: invite.phone,
+        role: invite.role,
+        inviteToken: invite.invite_token,
+        status: invite.status,
+        invitedBy: invite.invited_by,
+        inviterEmail: invite.inviter_email,
+        expiresAt: invite.expires_at,
+        createdAt: invite.created_at,
+        updatedAt: invite.updated_at,
+        acceptedAt: invite.accepted_at || invite.user_accepted_at,
+        acceptedBy: invite.accepted_by || invite.accepted_user_id,
+        acceptedUserEmail: invite.accepted_user_email,
+        userInviteStatus: invite.user_invite_status,
+      }));
+
+      return reply.send({ invites });
+    } catch (error) {
+      request.log.error({ 
+        err: error, 
+        stack: error.stack,
+        message: error.message,
+      }, 'Failed to fetch business invites');
+      
+      return reply.code(500).send({ 
+        message: 'Failed to fetch invites',
+        error: error.message,
+      });
+    }
+  });
+
   // Invite user to business (send email with invite link)
   app.post('/businesses/:id/invites', {
     preValidation: [app.authenticate],
@@ -587,14 +725,33 @@ async function businessesRoutes(app) {
       `);
 
       if (invitesTableCheck.rows[0]?.exists) {
-        // Insert invite record
-        await app.pg.query(
-          `INSERT INTO public.business_invites (business_id, email, phone, role, invite_token, invited_by, expires_at, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-           ON CONFLICT (business_id, COALESCE(email, ''), COALESCE(phone, '')) 
-           DO UPDATE SET invite_token = $5, expires_at = $7, status = 'pending', updated_at = now()`,
-          [id, email || null, phone || null, role, inviteToken, user.id, inviteData.expiresAt]
+        // Check if an invite already exists for this business, email, and phone combination
+        const existingInvite = await app.pg.query(
+          `SELECT id FROM public.business_invites 
+           WHERE business_id = $1 
+           AND (email = $2 OR ($2 IS NULL AND email IS NULL))
+           AND (phone = $3 OR ($3 IS NULL AND phone IS NULL))
+           AND role = $4
+           LIMIT 1`,
+          [id, email || null, phone || null, role]
         );
+
+        if (existingInvite.rows.length > 0) {
+          // Update existing invite
+          await app.pg.query(
+            `UPDATE public.business_invites 
+             SET invite_token = $1, expires_at = $2, status = 'pending', updated_at = now()
+             WHERE id = $3`,
+            [inviteToken, inviteData.expiresAt, existingInvite.rows[0].id]
+          );
+        } else {
+          // Insert new invite record
+          await app.pg.query(
+            `INSERT INTO public.business_invites (business_id, email, phone, role, invite_token, invited_by, expires_at, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
+            [id, email || null, phone || null, role, inviteToken, user.id, inviteData.expiresAt]
+          );
+        }
       }
 
       // Generate invite link

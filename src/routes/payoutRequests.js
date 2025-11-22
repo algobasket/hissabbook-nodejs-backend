@@ -28,7 +28,7 @@ async function saveProofToDisk(base64String) {
   return fileName;
 }
 
-const { findUserByEmail, getUserRoles } = require('../services/userService');
+const { findUserByEmail, getUserRoles, hasPermission } = require('../services/userService');
 
 async function payoutRequestRoutes(app) {
   // Create payout request
@@ -93,13 +93,16 @@ async function payoutRequestRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user is admin
+      // Check if user has permission to view payouts
+      const canView = await hasPermission(app.pg, user.id, 'payouts.view');
+      if (!canView) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to view payout requests.' });
+      }
+
+      // Get user roles for filtering (managers see only their business payouts)
       const roles = await getUserRoles(app.pg, user.id);
       const isAdmin = roles.includes('admin');
-
-      if (!isAdmin) {
-        return reply.code(403).send({ message: 'Access denied. Admin role required.' });
-      }
+      const isManager = roles.includes('managers') || roles.includes('manager');
 
       // Check if payout_requests table exists
       const tableCheck = await app.pg.query(`
@@ -150,6 +153,7 @@ async function payoutRequestRoutes(app) {
             pr.remarks,
             pr.status,
             pr.book_id,
+            pr.proof_filename,
             pr.created_at,
             ${updatedAtField} as updated_at,
             u.email as user_email,
@@ -178,6 +182,7 @@ async function payoutRequestRoutes(app) {
             pr.utr,
             pr.remarks,
             pr.status,
+            pr.proof_filename,
             pr.created_at,
             ${updatedAtField} as updated_at,
             NULL::text as user_email,
@@ -190,9 +195,47 @@ async function payoutRequestRoutes(app) {
       }
 
       const params = [];
+      let paramIndex = 1;
+
+      // For managers, filter by their businesses
+      if (isManager && !isAdmin) {
+        // Get all businesses owned by this manager
+        const businessesResult = await app.pg.query(
+          'SELECT id FROM public.businesses WHERE owner_user_id = $1',
+          [user.id]
+        );
+        const businessIds = businessesResult.rows.map(b => b.id);
+
+        if (businessIds.length > 0) {
+          // Get all books for these businesses
+          const booksResult = await app.pg.query(
+            'SELECT id FROM public.books WHERE business_id = ANY($1::uuid[])',
+            [businessIds]
+          );
+          const bookIds = booksResult.rows.map(b => b.id);
+
+          if (bookIds.length > 0) {
+            query += ' WHERE pr.book_id = ANY($' + paramIndex + '::uuid[])';
+            params.push(bookIds);
+            paramIndex++;
+          } else {
+            // No books, return empty result
+            return reply.send({ payoutRequests: [] });
+          }
+        } else {
+          // No businesses, return empty result
+          return reply.send({ payoutRequests: [] });
+        }
+      }
+
       if (status && status !== 'all') {
-        query += ' WHERE pr.status = $1';
+        if (params.length > 0) {
+          query += ' AND pr.status = $' + paramIndex;
+        } else {
+          query += ' WHERE pr.status = $' + paramIndex;
+        }
         params.push(status);
+        paramIndex++;
       }
 
       query += ' ORDER BY pr.created_at DESC';
@@ -206,6 +249,13 @@ async function payoutRequestRoutes(app) {
         const year = new Date(row.created_at).getFullYear();
         const reference = `REQ-${year}-${shortId}`;
 
+        // Debug: log proof_filename value
+        request.log.info({ 
+          rowId: row.id, 
+          proof_filename: row.proof_filename,
+          hasProofFilename: !!row.proof_filename 
+        }, 'Processing payout request');
+
         return {
           id: row.id,
           reference,
@@ -218,6 +268,7 @@ async function payoutRequestRoutes(app) {
           updatedAt: row.updated_at,
           userEmail: row.user_email,
           userPhone: row.user_phone || null,
+          proofFilename: row.proof_filename || null,
         };
       });
 
@@ -262,22 +313,34 @@ async function payoutRequestRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user is admin
-      const roles = await getUserRoles(app.pg, user.id);
-      const isAdmin = roles.includes('admin');
-
-      if (!isAdmin) {
-        return reply.code(403).send({ message: 'Access denied. Admin role required.' });
-      }
-
       const { id } = request.params;
       const { status, notes } = request.body;
 
+      // Check permissions based on action
+      if (status === 'accepted') {
+        const canApprove = await hasPermission(app.pg, user.id, 'payouts.approve');
+        if (!canApprove) {
+          return reply.code(403).send({ message: 'Access denied. You do not have permission to approve payout requests.' });
+        }
+      } else if (status === 'rejected') {
+        const canReject = await hasPermission(app.pg, user.id, 'payouts.reject');
+        if (!canReject) {
+          return reply.code(403).send({ message: 'Access denied. You do not have permission to reject payout requests.' });
+        }
+      }
+
+      // Get user roles for business filtering (managers can only approve their own business payouts)
+      const roles = await getUserRoles(app.pg, user.id);
+      const isAdmin = roles.includes('admin');
+      const isManager = roles.includes('managers') || roles.includes('manager');
+
       // Check if request exists and is pending, get full details
       const existing = await app.pg.query(
-        `SELECT id, status, amount, utr, remarks, user_id, book_id, created_at 
-         FROM public.payout_requests 
-         WHERE id = $1`,
+        `SELECT pr.id, pr.status, pr.amount, pr.utr, pr.remarks, pr.user_id, pr.book_id, pr.created_at,
+               b.business_id
+         FROM public.payout_requests pr
+         LEFT JOIN public.books b ON pr.book_id = b.id
+         WHERE pr.id = $1`,
         [id]
       );
 
@@ -290,6 +353,18 @@ async function payoutRequestRoutes(app) {
       }
 
       const payoutRequest = existing.rows[0];
+
+      // For managers (not admin), verify they own the business for this payout request
+      if (isManager && !isAdmin && payoutRequest.business_id) {
+        const businessCheck = await app.pg.query(
+          'SELECT id FROM public.businesses WHERE id = $1 AND owner_user_id = $2',
+          [payoutRequest.business_id, user.id]
+        );
+        
+        if (businessCheck.rows.length === 0) {
+          return reply.code(403).send({ message: 'Access denied. You can only approve payout requests for your own businesses.' });
+        }
+      }
 
       // Check if updated_at column exists
       const updatedAtCheck = await app.pg.query(`

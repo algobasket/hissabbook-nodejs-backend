@@ -1,7 +1,60 @@
-const { findUserByEmail, createUser, getUserRoles } = require('../services/userService');
+const { findUserByEmail, createUser, getUserRoles, hasPermission, getUserPermissions } = require('../services/userService');
 const { generateAndSaveUpiQrCode } = require('../utils/qrcode');
 
 async function usersRoutes(app) {
+  // Check if user exists by email or phone
+  app.get('/users/check', {
+    preValidation: [app.authenticate],
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          email: { type: 'string' },
+          phone: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const { email, phone } = request.query;
+      
+      if (!email && !phone) {
+        return reply.code(400).send({ message: 'Email or phone is required' });
+      }
+
+      let user = null;
+      if (email) {
+        user = await findUserByEmail(app.pg, email);
+      } else if (phone) {
+        // Find user by phone from user_details
+        const result = await app.pg.query(
+          'SELECT user_id FROM public.user_details WHERE phone = $1 LIMIT 1',
+          [phone]
+        );
+        if (result.rows.length > 0) {
+          const userResult = await app.pg.query(
+            'SELECT id, email FROM public.users WHERE id = $1',
+            [result.rows[0].user_id]
+          );
+          if (userResult.rows.length > 0) {
+            user = userResult.rows[0];
+          }
+        }
+      }
+
+      return reply.send({
+        exists: !!user,
+        user: user ? {
+          id: user.id,
+          email: user.email,
+        } : null,
+      });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to check user existence');
+      return reply.code(500).send({ message: 'Failed to check user existence' });
+    }
+  });
+
   // Get admin users
   app.get('/users/admin', { preValidation: [app.authenticate] }, async (request, reply) => {
     try {
@@ -387,15 +440,35 @@ async function usersRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user is admin
+      // Get user roles for role-based restrictions and permission check
       const roles = await getUserRoles(app.pg, user.id);
-      const isAdmin = roles.includes('admin');
-
-      if (!isAdmin) {
-        return reply.code(403).send({ message: 'Access denied. Admin role required.' });
+      
+      // Check if user has permission to create users
+      const canCreate = await hasPermission(app.pg, user.id, 'users.create');
+      
+      // Debug logging
+      const permissions = await getUserPermissions(app.pg, user.id);
+      request.log.info({ 
+        userId: user.id, 
+        email: user.email,
+        roles, 
+        permissions, 
+        canCreate,
+        checkingPermission: 'users.create'
+      }, 'Permission check for creating users');
+      
+      if (!canCreate) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to create users.' });
       }
 
+      const isAdmin = roles.includes('admin');
+
       const { email, password, firstName, lastName, phone, upiId, role } = request.body;
+
+      // Managers can only create staff users
+      if (!isAdmin && role !== 'staff') {
+        return reply.code(403).send({ message: 'Access denied. Managers can only create staff users.' });
+      }
 
       // Check if email already exists
       const existing = await findUserByEmail(app.pg, email);
@@ -413,8 +486,14 @@ async function usersRoutes(app) {
         }
       }
 
-      // Create user
-      const newUser = await createUser(app.pg, { email, password, firstName, lastName });
+      // Create user with created_by tracking
+      const newUser = await createUser(app.pg, { 
+        email, 
+        password, 
+        firstName, 
+        lastName, 
+        createdBy: user.id 
+      });
 
       // Generate UPI QR code if UPI ID exists
       let qrCodeFilename = null;
@@ -478,6 +557,7 @@ async function usersRoutes(app) {
           status: newUser.status,
           roles: userRoles,
           createdAt: newUser.created_at,
+          createdBy: newUser.created_by,
         },
       });
     } catch (error) {

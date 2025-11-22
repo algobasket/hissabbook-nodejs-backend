@@ -107,9 +107,41 @@ function getFilePath(fileName) {
   return path.join(process.cwd(), 'uploads', fileName);
 }
 
+/**
+ * Save a base64 image to disk (wrapper for saveFileToDisk for images)
+ * @param {string} base64String - Base64 encoded image string (data:image/...;base64,...)
+ * @param {string} prefix - Prefix for the filename (e.g., "qr-code", "payout")
+ * @returns {Promise<string|null>} - Filename of the saved image or null
+ */
+async function saveImageToDisk(base64String, prefix = "image") {
+  if (!base64String) {
+    return null;
+  }
+  
+  try {
+    const result = await saveFileToDisk(base64String, prefix);
+    return result ? result.fileName : null;
+  } catch (error) {
+    throw error;
+  }
+}
+
+/**
+ * Delete an image from disk (alias for deleteFileFromDisk)
+ * @param {string} fileName - Name of the file to delete
+ * @returns {Promise<boolean>} - True if deleted, false otherwise
+ */
+async function deleteImageFromDisk(fileName) {
+  return deleteFileFromDisk(fileName);
+}
+
 module.exports = {
   saveFileToDisk,
   deleteFileFromDisk,
-  getFilePath
+  getFilePath,
+  saveImageToDisk,
+  deleteImageFromDisk,
 };
+
+
 

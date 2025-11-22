@@ -15,6 +15,7 @@ const dashboardRoutes = require('./routes/dashboard');
 const businessesRoutes = require('./routes/businesses');
 const permissionsRoutes = require('./routes/permissions');
 const invitesRoutes = require('./routes/invites');
+const subscriptionsRoutes = require('./routes/subscriptions');
 
 async function buildApp() {
   const app = fastify({
@@ -34,7 +35,7 @@ async function buildApp() {
   await app.register(jwt, {
     secret: process.env.JWT_SECRET,
     sign: {
-      expiresIn: process.env.JWT_EXPIRES_IN || '1h',
+      expiresIn: process.env.JWT_EXPIRES_IN || '7d', // Changed from 1h to 7 days
     },
   });
 
@@ -60,8 +61,31 @@ async function buildApp() {
     }
 
     try {
-      const filePath = path.join(process.cwd(), 'uploads', filename);
-      const fileBuffer = await fs.readFile(filePath);
+      // Try current directory first (hissabbook-nodejs-backend/uploads)
+      let filePath = path.join(process.cwd(), 'uploads', filename);
+      let fileBuffer;
+      
+      try {
+        fileBuffer = await fs.readFile(filePath);
+      } catch (error) {
+        // If not found, try the api-system uploads directory
+        if (error.code === 'ENOENT') {
+          const apiSystemPath = path.join(process.cwd(), '..', 'hissabbook-api-system', 'uploads', filename);
+          try {
+            fileBuffer = await fs.readFile(apiSystemPath);
+            request.log.info({ filename, path: apiSystemPath }, 'Serving file from api-system directory');
+          } catch (apiSystemError) {
+            // If still not found, return 404
+            if (apiSystemError.code === 'ENOENT') {
+              request.log.warn({ filename, triedPaths: [filePath, apiSystemPath] }, 'File not found in any uploads directory');
+              return reply.code(404).send({ message: 'File not found' });
+            }
+            throw apiSystemError;
+          }
+        } else {
+          throw error;
+        }
+      }
 
       // Determine content type based on file extension
       const ext = path.extname(filename).toLowerCase();
@@ -97,6 +121,8 @@ async function buildApp() {
   await app.register(businessesRoutes, { prefix: '/api' });
   await app.register(permissionsRoutes, { prefix: '/api' });
   await app.register(invitesRoutes, { prefix: '/api' });
+  await app.register(require('./routes/settings'), { prefix: '/api' });
+  await app.register(subscriptionsRoutes, { prefix: '/api' });
 
   return app;
 }
