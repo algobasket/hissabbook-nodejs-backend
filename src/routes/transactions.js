@@ -261,6 +261,69 @@ async function transactionsRoutes(app) {
       });
     }
   });
+
+  // Delete transaction (admin only)
+  app.delete('/transactions/:id', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Check if user is admin
+      const roles = await getUserRoles(app.pg, user.id);
+      const isAdmin = roles.includes('admin');
+
+      if (!isAdmin) {
+        return reply.code(403).send({ message: 'Access denied. Admin role required to delete transactions.' });
+      }
+
+      const { id } = request.params;
+
+      // Check if transaction exists
+      const existing = await app.pg.query(
+        'SELECT id FROM public.transactions WHERE id = $1',
+        [id]
+      );
+
+      if (existing.rows.length === 0) {
+        return reply.code(404).send({ message: 'Transaction not found' });
+      }
+
+      // Delete transaction
+      const deleteResult = await app.pg.query(
+        'DELETE FROM public.transactions WHERE id = $1',
+        [id]
+      );
+
+      if (deleteResult.rowCount === 0) {
+        return reply.code(404).send({ message: 'Transaction not found or already deleted' });
+      }
+
+      return reply.send({
+        success: true,
+        message: 'Transaction deleted successfully',
+      });
+    } catch (error) {
+      request.log.error({ 
+        err: error, 
+        stack: error.stack,
+        message: error.message,
+        code: error.code,
+        detail: error.detail
+      }, 'Failed to delete transaction');
+      
+      const errorMessage = error.detail || error.message || 'Failed to delete transaction';
+      return reply.code(500).send({ 
+        message: errorMessage, 
+        error: error.message,
+        code: error.code,
+        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+  });
 }
 
 module.exports = transactionsRoutes;
