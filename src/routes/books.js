@@ -76,10 +76,12 @@ async function booksRoutes(app) {
             FROM public.entries e 
             WHERE e.book_id = b.id),
             0
-          ) as total_balance
+          ) as total_balance,
+          COALESCE(biz.master_wallet_balance, 0) as master_wallet_balance
         FROM public.books b
         INNER JOIN public.users u ON b.owner_user_id = u.id
         LEFT JOIN public.user_details ud ON u.id = ud.user_id
+        LEFT JOIN public.businesses biz ON b.business_id = biz.id
       `;
 
       const params = [];
@@ -162,6 +164,7 @@ async function booksRoutes(app) {
           transactionCount: parseInt(row.transaction_count || '0', 10),
           memberCount: parseInt(row.member_count || '1', 10),
           totalBalance: parseFloat(row.total_balance || '0'),
+          masterWalletBalance: parseFloat(row.master_wallet_balance || '0'),
           createdAt: row.created_at,
           updatedAt: row.updated_at,
         };
@@ -280,6 +283,7 @@ async function booksRoutes(app) {
           ownerPhone: owner?.phone || null,
           transactionCount: 0,
           totalBalance: 0,
+          masterWalletBalance: 0,
           createdAt: newBook.created_at,
           updatedAt: newBook.updated_at,
         },
@@ -970,10 +974,10 @@ async function booksRoutes(app) {
 
       // Create new book with same settings
       const newBookResult = await app.pg.query(
-        `INSERT INTO public.books (name, description, currency_code, owner_user_id)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, name, description, currency_code, owner_user_id, created_at, updated_at`,
-        [newName, book.description, book.currency_code, user.id]
+        `INSERT INTO public.books (name, description, currency_code, owner_user_id, business_id)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, name, description, currency_code, owner_user_id, business_id, created_at, updated_at`,
+        [newName, book.description, book.currency_code, book.owner_user_id, book.business_id]
       );
 
       const newBook = newBookResult.rows[0];
@@ -1639,6 +1643,7 @@ async function booksRoutes(app) {
           ud.first_name as owner_first_name,
           ud.last_name as owner_last_name,
           ud.phone as owner_phone,
+          COALESCE(biz.master_wallet_balance, 0) as master_wallet_balance,
           COALESCE(
             (SELECT COUNT(*)::integer
              FROM public.entries e 
@@ -1658,6 +1663,7 @@ async function booksRoutes(app) {
         FROM public.books b
         INNER JOIN public.users u ON b.owner_user_id = u.id
         LEFT JOIN public.user_details ud ON u.id = ud.user_id
+        LEFT JOIN public.businesses biz ON b.business_id = biz.id
         WHERE b.id = $1`,
         [id]
       );
@@ -1686,6 +1692,7 @@ async function booksRoutes(app) {
         ownerPhone: row.owner_phone || null,
         transactionCount: parseInt(row.transaction_count || '0', 10),
         totalBalance: parseFloat(row.total_balance || '0'),
+        masterWalletBalance: parseFloat(row.master_wallet_balance || '0'),
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       };

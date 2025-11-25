@@ -96,8 +96,72 @@ If you didn't expect this invitation, you can safely ignore this email.
   }
 }
 
+async function sendVerificationEmail({ email, verificationLink }) {
+  const smtpUser = process.env.SMTP_USER || process.env.GMAIL_USER;
+  const fromEmail = process.env.SMTP_FROM_EMAIL || process.env.GMAIL_FROM_EMAIL || smtpUser || 'noreply@hissabbook.com';
+
+  if (!smtpUser) {
+    throw new Error('SMTP configuration missing. Please set SMTP_USER environment variable.');
+  }
+
+  const transporter = createTransporter();
+
+  const mailOptions = {
+    from: `"HissabBook" <${fromEmail}>`,
+    to: email,
+    subject: 'Verify your email address - HissabBook',
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="background: linear-gradient(135deg, #2f4bff 0%, #2357FF 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+          <h1 style="color: white; margin: 0; font-size: 28px;">HissabBook</h1>
+        </div>
+        <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 10px 10px; border: 1px solid #e5e7eb;">
+          <h2 style="color: #111827; margin-top: 0;">Verify Your Email Address</h2>
+          <p style="color: #6b7280; font-size: 16px; line-height: 1.6;">
+            Please click the button below to verify your email address. This will confirm that you own this email account.
+          </p>
+          <div style="background: white; padding: 20px; border-radius: 8px; text-align: center; margin: 30px 0; border: 2px dashed #2f4bff;">
+            <a href="${verificationLink}" style="display: inline-block; background: #2f4bff; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 16px;">
+              Verify Email Address
+            </a>
+          </div>
+          <p style="color: #6b7280; font-size: 14px; line-height: 1.6;">
+            Or copy and paste this link into your browser:
+          </p>
+          <p style="color: #2f4bff; font-size: 12px; word-break: break-all; background: white; padding: 10px; border-radius: 4px; margin: 10px 0;">
+            ${verificationLink}
+          </p>
+          <p style="color: #9ca3af; font-size: 12px; line-height: 1.6; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+            This verification link will expire in 24 hours. If you didn't request this email, please ignore it.
+          </p>
+        </div>
+      </div>
+    `,
+    text: `
+HissabBook - Verify Your Email Address
+
+Please click the link below to verify your email address:
+
+${verificationLink}
+
+This verification link will expire in 24 hours. If you didn't request this email, please ignore it.
+    `,
+  };
+
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    return {
+      success: true,
+      messageId: info.messageId,
+    };
+  } catch (error) {
+    throw new Error(`Failed to send verification email: ${error.message}`);
+  }
+}
+
 module.exports = {
   sendInviteEmail,
+  sendVerificationEmail,
   createTransporter,
 };
 

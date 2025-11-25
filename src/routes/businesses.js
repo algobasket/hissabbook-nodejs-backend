@@ -48,6 +48,7 @@ async function businessesRoutes(app) {
           b.owner_user_id,
           b.master_wallet_upi,
           b.master_wallet_qr_code,
+          b.master_wallet_balance,
           b.status,
           b.business_address,
           b.staff_size,
@@ -92,6 +93,7 @@ async function businessesRoutes(app) {
           ownerName: ownerFullName,
           masterWalletUpi: row.master_wallet_upi || null,
           masterWalletQrCode: row.master_wallet_qr_code || null,
+          masterWalletBalance: parseFloat(row.master_wallet_balance || 0),
           status: row.status,
           businessAddress: row.business_address || null,
           staffSize: row.staff_size || null,
@@ -180,10 +182,10 @@ async function businessesRoutes(app) {
 
       // Create business
       const result = await app.pg.query(
-        `INSERT INTO public.businesses (name, description, owner_user_id, master_wallet_upi, master_wallet_qr_code)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, name, description, owner_user_id, master_wallet_upi, master_wallet_qr_code, status, created_at, updated_at`,
-        [name, description || null, user.id, finalUpiId, qrCodeFilename]
+        `INSERT INTO public.businesses (name, description, owner_user_id, master_wallet_upi, master_wallet_qr_code, master_wallet_balance)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, name, description, owner_user_id, master_wallet_upi, master_wallet_qr_code, master_wallet_balance, status, created_at, updated_at`,
+        [name, description || null, user.id, finalUpiId, qrCodeFilename, 0.00]
       );
 
       const newBusiness = result.rows[0];
@@ -214,6 +216,7 @@ async function businessesRoutes(app) {
           ownerName: ownerFullName,
           masterWalletUpi: newBusiness.master_wallet_upi,
           masterWalletQrCode: newBusiness.master_wallet_qr_code,
+          masterWalletBalance: parseFloat(newBusiness.master_wallet_balance || 0),
           status: newBusiness.status,
           createdAt: newBusiness.created_at,
           updatedAt: newBusiness.updated_at,
@@ -387,17 +390,38 @@ async function businessesRoutes(app) {
         UPDATE public.businesses
         SET ${updates.join(', ')}
         WHERE id = $${paramIndex} AND owner_user_id = $${paramIndex + 1}
-        RETURNING id, name, description, owner_user_id, master_wallet_upi, master_wallet_qr_code, status, 
+        RETURNING id, name, description, owner_user_id, master_wallet_upi, master_wallet_qr_code, master_wallet_balance, status, 
           business_address, staff_size, business_category, business_subcategory, business_type, 
           business_registration_type, gst_number, business_mobile, business_email, created_at, updated_at
       `;
       params.push(user.id);
 
       const result = await app.pg.query(query, params);
+      const updatedBusiness = result.rows[0];
 
       return reply.send({
         success: true,
-        business: result.rows[0],
+        business: {
+          id: updatedBusiness.id,
+          name: updatedBusiness.name,
+          description: updatedBusiness.description || null,
+          ownerId: updatedBusiness.owner_user_id,
+          masterWalletUpi: updatedBusiness.master_wallet_upi || null,
+          masterWalletQrCode: updatedBusiness.master_wallet_qr_code || null,
+          masterWalletBalance: parseFloat(updatedBusiness.master_wallet_balance || 0),
+          status: updatedBusiness.status,
+          businessAddress: updatedBusiness.business_address || null,
+          staffSize: updatedBusiness.staff_size || null,
+          businessCategory: updatedBusiness.business_category || null,
+          businessSubcategory: updatedBusiness.business_subcategory || null,
+          businessType: updatedBusiness.business_type || null,
+          businessRegistrationType: updatedBusiness.business_registration_type || null,
+          gstNumber: updatedBusiness.gst_number || null,
+          businessMobile: updatedBusiness.business_mobile || null,
+          businessEmail: updatedBusiness.business_email || null,
+          createdAt: updatedBusiness.created_at,
+          updatedAt: updatedBusiness.updated_at,
+        },
       });
     } catch (error) {
       request.log.error({ 

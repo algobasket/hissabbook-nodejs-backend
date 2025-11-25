@@ -282,7 +282,7 @@ async function payoutRequestRoutes(app) {
         code: error.code,
         detail: error.detail,
         hint: error.hint
-      }, 'Failed to fetch payout requests');
+      }, 'Failed to fetch payout requests'); 
       
       const errorMessage = error.detail || error.message || 'Failed to fetch payout requests';
       return reply.code(500).send({ 
@@ -433,7 +433,7 @@ async function payoutRequestRoutes(app) {
       // Check if request exists and is pending, get full details
       const existing = await app.pg.query(
         `SELECT pr.id, pr.status, pr.amount, pr.utr, pr.remarks, pr.user_id, pr.book_id, pr.created_at,
-               b.business_id, pr.business_id as payout_business_id
+               pr.proof_filename, b.business_id, pr.business_id as payout_business_id
          FROM public.payout_requests pr
          LEFT JOIN public.books b ON pr.book_id = b.id
          WHERE pr.id = $1`,
@@ -560,12 +560,13 @@ async function payoutRequestRoutes(app) {
                 const entryDate = now.toISOString().split('T')[0]; // YYYY-MM-DD
                 const entryTime = now.toTimeString().split(' ')[0]; // HH:MM:SS
 
-                await client.query(
+                const entryResult = await client.query(
                   `INSERT INTO public.entries (
                     book_id, entry_type, amount, party_name, 
                     payment_mode, remarks, entry_date, entry_time, created_by
                   )
-                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                  RETURNING id`,
                   [
                     payoutBookId,
                     'cash_out',
@@ -578,6 +579,74 @@ async function payoutRequestRoutes(app) {
                     user.id, // Created by the manager who approved
                   ]
                 );
+
+                const entryId = entryResult.rows[0].id;
+
+                // Link the proof file from payout request to the entry attachment if it exists
+                if (payoutRequest.proof_filename) {
+                  try {
+                    const uploadDir = path.join(process.cwd(), 'uploads');
+                    const proofPath = path.join(uploadDir, payoutRequest.proof_filename);
+                    
+                    // Check if file exists and get file stats
+                    let fileStats;
+                    try {
+                      fileStats = await fs.stat(proofPath);
+                    } catch (err) {
+                      request.log.warn({ proof_path: proofPath }, 'Proof file not found, skipping attachment creation');
+                      fileStats = null;
+                    }
+
+                    if (fileStats) {
+                      // Determine file type and mime type from filename
+                      const fileNameParts = payoutRequest.proof_filename.split('.');
+                      const fileExtension = (fileNameParts.length > 1 ? fileNameParts.pop() : '').toLowerCase();
+                      const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(fileExtension);
+                      const isPdf = fileExtension === 'pdf';
+                      const fileType = isImage ? 'image' : (isPdf ? 'pdf' : 'document');
+                      
+                      // Determine mime type
+                      const mimeTypes = {
+                        'jpg': 'image/jpeg',
+                        'jpeg': 'image/jpeg',
+                        'png': 'image/png',
+                        'gif': 'image/gif',
+                        'webp': 'image/webp',
+                        'pdf': 'application/pdf',
+                      };
+                      const mimeType = mimeTypes[fileExtension] || 'application/octet-stream';
+
+                      // Create entry attachment linking to the proof file
+                      await client.query(
+                        `INSERT INTO public.entry_attachments (
+                          entry_id, book_id, file_name, file_path, file_type, file_size, mime_type
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                        [
+                          entryId,
+                          payoutBookId,
+                          payoutRequest.proof_filename,
+                          proofPath,
+                          fileType,
+                          fileStats.size,
+                          mimeType,
+                        ]
+                      );
+
+                      request.log.info({
+                        entry_id: entryId,
+                        proof_filename: payoutRequest.proof_filename,
+                      }, 'Linked payout proof file to cash-out entry');
+                    }
+                  } catch (attachmentError) {
+                    // Log error but don't fail the transaction
+                    request.log.error({ 
+                      err: attachmentError,
+                      entry_id: entryId,
+                      proof_filename: payoutRequest.proof_filename,
+                    }, 'Failed to create entry attachment for payout proof');
+                  }
+                }
 
                 // Update wallet balance if wallet exists (decrease balance for cash-out)
                 const walletResult = await client.query(

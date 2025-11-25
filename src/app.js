@@ -20,7 +20,7 @@ const subscriptionsRoutes = require('./routes/subscriptions');
 async function buildApp() {
   const app = fastify({
     logger: true,
-  });
+  }); 
 
   await app.register(cors, {
     origin: true,

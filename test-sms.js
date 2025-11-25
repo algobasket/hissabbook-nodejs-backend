@@ -8,19 +8,10 @@ async function sendTestOTP() {
   const API_KEY = "PfDX4CojBOuH0U3yLdF6w2arxqnScI1ZeV9kmTbtl5RghNpJGWazSufLIYGFT2R0m9jvQ4cN8Kd1oV3U";
 
   // Test mobile number (must be 10 digits)
-  const number = "9713864769";  
+  const number = "8638720242";      
 
   // OTP value (numeric) 
-  const otpValue = "123456"; 
-
-  // Build query params
-  // const params = {
-  //   authorization: API_KEY,
-  //   route: "otp",
-  //   variables_values: otpValue,
-  //   numbers: number,
-  //   flash: "0",
-  // };
+  const otpValue = "123456";  
 
 
   const params = {

@@ -1,6 +1,8 @@
+const crypto = require('crypto');
 const { verifyPassword, hashPassword } = require('../utils/password');
 const { findUserByEmail, createUser, getUserRoles, getUserDetails, updateUserDetails } = require('../services/userService');
 const { saveImageToDisk, deleteImageFromDisk } = require('../utils/fileUpload');
+const { sendVerificationEmail } = require('../utils/email');
 
 async function authRoutes(app) {
   app.post('/register', {
@@ -175,6 +177,7 @@ async function authRoutes(app) {
           upiQrCode: null,
           role: primaryRole,
           roles: roles,
+          isEmailVerified: user.is_email_verified || false,
         });
       }
 
@@ -205,6 +208,7 @@ async function authRoutes(app) {
         upiQrCode: userDetails.upi_qr_code || null,
         role: primaryRole,
         roles: roles,
+        isEmailVerified: user.is_email_verified || false,
       });
     } catch (error) {
       request.log.error({ err: error, stack: error.stack }, 'Failed to fetch account details');
@@ -339,9 +343,8 @@ async function authRoutes(app) {
     schema: {
       body: {
         type: 'object',
-        required: ['currentPassword', 'newPassword'],
+        required: ['newPassword'],
         properties: {
-          currentPassword: { type: 'string', minLength: 1 },
           newPassword: { type: 'string', minLength: 8 },
         },
       },
@@ -353,13 +356,7 @@ async function authRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      const { currentPassword, newPassword } = request.body;
-
-      // Verify current password
-      const isValid = await verifyPassword(currentPassword, user.password_hash);
-      if (!isValid) {
-        return reply.code(401).send({ message: 'Current password is incorrect' });
-      }
+      const { newPassword } = request.body;
 
       // Hash new password
       const passwordHash = await hashPassword(newPassword);
@@ -378,6 +375,161 @@ async function authRoutes(app) {
       request.log.error({ err: error }, 'Failed to change password');
       return reply.code(500).send({
         message: 'Failed to change password',
+        error: error.message,
+      });
+    }
+  });
+
+  // Change email endpoint
+  app.put('/change-email', {
+    preValidation: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['newEmail'],
+        properties: {
+          newEmail: { type: 'string', format: 'email' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      const { newEmail } = request.body;
+
+      // Check if email is already in use
+      const existingUser = await findUserByEmail(app.pg, newEmail);
+      if (existingUser && existingUser.id !== user.id) {
+        return reply.code(409).send({ message: 'Email already in use' });
+      }
+
+      // Update email
+      await app.pg.query(
+        'UPDATE public.users SET email = $1, updated_at = now() WHERE id = $2',
+        [newEmail.toLowerCase(), user.id]
+      );
+
+      return reply.send({
+        success: true,
+        message: 'Email changed successfully',
+      });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to change email');
+      return reply.code(500).send({
+        message: 'Failed to change email',
+        error: error.message,
+      });
+    }
+  });
+
+  // Send verification email endpoint
+  app.post('/send-verification-email', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      if (user.is_email_verified) {
+        return reply.code(400).send({ message: 'Email is already verified' });
+      }
+
+      // Generate verification token
+      const verificationToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 24); // Token expires in 24 hours
+
+      // Store verification token in database (you might want to create a separate table for this)
+      // For now, we'll store it in a simple way - you could create an email_verifications table
+      await app.pg.query(
+        `INSERT INTO public.email_verifications (user_id, token, expires_at, created_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (user_id) DO UPDATE
+         SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at, created_at = now()`,
+        [user.id, verificationToken, expiresAt]
+      );
+
+      // Generate verification link
+      const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+      const verificationLink = `${baseUrl}/verify-email?token=${verificationToken}`;
+
+      // Send verification email
+      await sendVerificationEmail({
+        email: user.email,
+        verificationLink,
+      });
+
+      return reply.send({
+        success: true,
+        message: 'Verification email sent successfully',
+      });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to send verification email');
+      return reply.code(500).send({
+        message: 'Failed to send verification email',
+        error: error.message,
+      });
+    }
+  });
+
+  // Verify email endpoint
+  app.get('/verify-email', {
+    schema: {
+      querystring: {
+        type: 'object',
+        required: ['token'],
+        properties: {
+          token: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const { token } = request.query;
+
+      // Find verification token
+      const result = await app.pg.query(
+        `SELECT user_id, expires_at FROM public.email_verifications WHERE token = $1`,
+        [token]
+      );
+
+      if (result.rows.length === 0) {
+        return reply.code(400).send({ message: 'Invalid verification token' });
+      }
+
+      const verification = result.rows[0];
+      const now = new Date();
+
+      if (now > verification.expires_at) {
+        return reply.code(400).send({ message: 'Verification token has expired' });
+      }
+
+      // Update user's email verification status
+      await app.pg.query(
+        'UPDATE public.users SET is_email_verified = true, updated_at = now() WHERE id = $1',
+        [verification.user_id]
+      );
+
+      // Delete used verification token
+      await app.pg.query(
+        'DELETE FROM public.email_verifications WHERE token = $1',
+        [token]
+      );
+
+      return reply.send({
+        success: true,
+        message: 'Email verified successfully',
+      });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to verify email');
+      return reply.code(500).send({
+        message: 'Failed to verify email',
         error: error.message,
       });
     }
