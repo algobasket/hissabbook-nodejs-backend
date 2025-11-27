@@ -492,9 +492,13 @@ async function booksRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user has permission to manage cashbooks
+      // Check if user has permission to manage cashbooks (update, cashin, or cashout)
       const canUpdate = await hasPermission(app.pg, user.id, 'cashbooks.update');
-      if (!canUpdate) {
+      const canCashIn = await hasPermission(app.pg, user.id, 'cashbooks.cashin');
+      const canCashOut = await hasPermission(app.pg, user.id, 'cashbooks.cashout');
+      const canCreate = await hasPermission(app.pg, user.id, 'cashbooks.create');
+      
+      if (!canUpdate && !canCashIn && !canCashOut && !canCreate) {
         return reply.code(403).send({ message: 'Access denied. You do not have permission to manage cashbooks.' });
       }
 
@@ -638,9 +642,13 @@ async function booksRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user has permission to manage cashbooks
+      // Check if user has permission to manage cashbooks (update, cashin, or cashout)
       const canUpdate = await hasPermission(app.pg, user.id, 'cashbooks.update');
-      if (!canUpdate) {
+      const canCashIn = await hasPermission(app.pg, user.id, 'cashbooks.cashin');
+      const canCashOut = await hasPermission(app.pg, user.id, 'cashbooks.cashout');
+      const canCreate = await hasPermission(app.pg, user.id, 'cashbooks.create');
+      
+      if (!canUpdate && !canCashIn && !canCashOut && !canCreate) {
         return reply.code(403).send({ message: 'Access denied. You do not have permission to manage cashbooks.' });
       }
 
@@ -707,9 +715,13 @@ async function booksRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user has permission to manage cashbooks
+      // Check if user has permission to manage cashbooks (update, cashin, or cashout)
       const canUpdate = await hasPermission(app.pg, user.id, 'cashbooks.update');
-      if (!canUpdate) {
+      const canCashIn = await hasPermission(app.pg, user.id, 'cashbooks.cashin');
+      const canCashOut = await hasPermission(app.pg, user.id, 'cashbooks.cashout');
+      const canCreate = await hasPermission(app.pg, user.id, 'cashbooks.create');
+      
+      if (!canUpdate && !canCashIn && !canCashOut && !canCreate) {
         return reply.code(403).send({ message: 'Access denied. You do not have permission to manage cashbooks.' });
       }
 
@@ -733,9 +745,30 @@ async function booksRoutes(app) {
       // Check if user is admin or owner
       const roles = await getUserRoles(app.pg, user.id);
       const isAdmin = roles.includes('admin');
+      const isOwner = book.owner_user_id === user.id;
 
-      if (!isAdmin && book.owner_user_id !== user.id) {
-        return reply.code(403).send({ message: 'Access denied. Only the book owner can upload attachments.' });
+      // Also check if user has cashin/cashout permissions and is a member of the book
+      if (!isAdmin && !isOwner) {
+        const canCashIn = await hasPermission(app.pg, user.id, 'cashbooks.cashin');
+        const canCashOut = await hasPermission(app.pg, user.id, 'cashbooks.cashout');
+        const canCreate = await hasPermission(app.pg, user.id, 'cashbooks.create');
+        const canUpdate = await hasPermission(app.pg, user.id, 'cashbooks.update');
+        
+        const hasEntryPermission = canCashIn || canCashOut || canCreate || canUpdate;
+        
+        if (hasEntryPermission) {
+          // Check if user is a member of this book
+          const memberCheck = await app.pg.query(
+            'SELECT 1 FROM public.book_users WHERE book_id = $1 AND user_id = $2',
+            [bookId, user.id]
+          );
+          
+          if (memberCheck.rows.length === 0) {
+            return reply.code(403).send({ message: 'Access denied. You must be a member of this book to upload attachments.' });
+          }
+        } else {
+          return reply.code(403).send({ message: 'Access denied. Only the book owner can upload attachments.' });
+        }
       }
 
       // Save file to disk
@@ -886,9 +919,13 @@ async function booksRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user has permission to manage cashbooks
+      // Check if user has permission to manage cashbooks (update, cashin, or cashout)
       const canUpdate = await hasPermission(app.pg, user.id, 'cashbooks.update');
-      if (!canUpdate) {
+      const canCashIn = await hasPermission(app.pg, user.id, 'cashbooks.cashin');
+      const canCashOut = await hasPermission(app.pg, user.id, 'cashbooks.cashout');
+      const canCreate = await hasPermission(app.pg, user.id, 'cashbooks.create');
+      
+      if (!canUpdate && !canCashIn && !canCashOut && !canCreate) {
         return reply.code(403).send({ message: 'Access denied. You do not have permission to manage cashbooks.' });
       }
 
@@ -1050,12 +1087,6 @@ async function booksRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user has permission to create cashbook entries
-      const canCreate = await hasPermission(app.pg, user.id, 'cashbooks.create');
-      if (!canCreate) {
-        return reply.code(403).send({ message: 'Access denied. You do not have permission to create entries.' });
-      }
-
       const { id: bookId } = request.params;
       const {
         entryType,
@@ -1070,6 +1101,19 @@ async function booksRoutes(app) {
         entryTime,
         attachmentIds = [],
       } = request.body;
+
+      // Check if user has permission to create this specific type of entry
+      // Check for specific permission (cashin/cashout) OR general create permission
+      const specificPermission = entryType === 'cash_in' ? 'cashbooks.cashin' : 'cashbooks.cashout';
+      const hasSpecificPermission = await hasPermission(app.pg, user.id, specificPermission);
+      const hasCreatePermission = await hasPermission(app.pg, user.id, 'cashbooks.create');
+      
+      if (!hasSpecificPermission && !hasCreatePermission) {
+        const entryTypeName = entryType === 'cash_in' ? 'cash in' : 'cash out';
+        return reply.code(403).send({ 
+          message: `Access denied. You do not have permission to create ${entryTypeName} entries.` 
+        });
+      }
 
       // Verify book exists and user has access
       const bookResult = await app.pg.query(
@@ -1439,85 +1483,126 @@ async function booksRoutes(app) {
         }
       }
 
-      // Build query with filters
+      // Build query with filters and running balance calculation
+      // Calculate balance from ALL entries (for accurate running balance)
+      // Then apply filters to determine which entries to return
       let query = `
-        SELECT 
-          e.id,
-          e.entry_type,
-          e.amount,
-          e.party_name,
-          e.category_name,
-          e.payment_mode,
-          e.remarks,
-          e.entry_date,
-          e.entry_time,
-          e.created_at,
-          e.created_by,
-          u.email as created_by_email,
-          ud.first_name as created_by_first_name,
-          ud.last_name as created_by_last_name
-        FROM public.entries e
-        LEFT JOIN public.users u ON e.created_by = u.id
-        LEFT JOIN public.user_details ud ON u.id = ud.user_id
-        WHERE e.book_id = $1
+        WITH all_entries_with_balance AS (
+          SELECT 
+            e.id,
+            e.entry_type,
+            e.amount,
+            e.party_id,
+            e.party_name,
+            e.category_id,
+            e.category_name,
+            e.payment_mode,
+            e.remarks,
+            e.entry_date,
+            e.entry_time,
+            e.created_at,
+            e.created_by,
+            u.email as created_by_email,
+            ud.first_name as created_by_first_name,
+            ud.last_name as created_by_last_name,
+            SUM(
+              CASE 
+                WHEN e.entry_type = 'cash_in' THEN e.amount
+                WHEN e.entry_type = 'cash_out' THEN -e.amount
+                ELSE 0
+              END
+            ) OVER (
+              PARTITION BY e.book_id 
+              ORDER BY e.entry_date ASC, e.entry_time ASC, e.created_at ASC
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) as balance
+          FROM public.entries e
+          LEFT JOIN public.users u ON e.created_by = u.id
+          LEFT JOIN public.user_details ud ON u.id = ud.user_id
+          WHERE e.book_id = $1
+        ),
+        filtered_entries AS (
+          SELECT * FROM all_entries_with_balance
+          WHERE 1=1
       `;
       const queryParams = [bookId];
       let paramIndex = 2;
 
       if (entryType && entryType !== 'all') {
-        query += ` AND e.entry_type = $${paramIndex}`;
+        query += ` AND entry_type = $${paramIndex}`;
         queryParams.push(entryType);
         paramIndex++;
       }
 
       if (partyId && partyId !== 'all') {
-        query += ` AND e.party_id = $${paramIndex}`;
+        query += ` AND party_id = $${paramIndex}`;
         queryParams.push(partyId);
         paramIndex++;
       }
 
       if (categoryId && categoryId !== 'all') {
-        query += ` AND e.category_id = $${paramIndex}`;
+        query += ` AND category_id = $${paramIndex}`;
         queryParams.push(categoryId);
         paramIndex++;
       }
 
       if (paymentMode && paymentMode !== 'all') {
-        query += ` AND e.payment_mode = $${paramIndex}`;
+        query += ` AND payment_mode = $${paramIndex}`;
         queryParams.push(paymentMode);
         paramIndex++;
       }
 
       if (memberId && memberId !== 'all') {
-        query += ` AND e.created_by = $${paramIndex}`;
+        query += ` AND created_by = $${paramIndex}`;
         queryParams.push(memberId);
         paramIndex++;
       }
 
       if (startDate) {
-        query += ` AND e.entry_date >= $${paramIndex}`;
+        query += ` AND entry_date >= $${paramIndex}`;
         queryParams.push(startDate);
         paramIndex++;
       }
 
       if (endDate) {
-        query += ` AND e.entry_date <= $${paramIndex}`;
+        query += ` AND entry_date <= $${paramIndex}`;
         queryParams.push(endDate);
         paramIndex++;
       }
 
       if (search) {
         query += ` AND (
-          e.remarks ILIKE $${paramIndex} OR 
-          e.amount::text ILIKE $${paramIndex} OR
-          e.party_name ILIKE $${paramIndex} OR
-          e.category_name ILIKE $${paramIndex}
+          remarks ILIKE $${paramIndex} OR 
+          amount::text ILIKE $${paramIndex} OR
+          party_name ILIKE $${paramIndex} OR
+          category_name ILIKE $${paramIndex}
         )`;
         queryParams.push(`%${search}%`);
         paramIndex++;
       }
 
-      query += ` ORDER BY e.entry_date DESC, e.entry_time DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+      // Close the filtered CTE and apply final ordering and pagination
+      query += `
+        )
+        SELECT 
+          id,
+          entry_type,
+          amount,
+          party_name,
+          category_name,
+          payment_mode,
+          remarks,
+          entry_date,
+          entry_time,
+          created_at,
+          created_by,
+          created_by_email,
+          created_by_first_name,
+          created_by_last_name,
+          balance
+        FROM filtered_entries
+        ORDER BY entry_date DESC, entry_time DESC, created_at DESC
+        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
       queryParams.push(parseInt(limit), parseInt(offset));
 
       const result = await app.pg.query(query, queryParams);
@@ -1608,11 +1693,15 @@ async function booksRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      // Check if user has permission to update cashbooks (needed to add members)
-      const canUpdate = await hasPermission(app.pg, user.id, 'cashbooks.update');
-      if (!canUpdate) {
-        return reply.code(403).send({ message: 'Access denied. You do not have permission to manage book members.' });
+      // Check if user has permission to view cashbooks
+      const canView = await hasPermission(app.pg, user.id, 'cashbooks.view');
+      if (!canView) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to view cashbooks.' });
       }
+
+      // Check if user is admin
+      const roles = await getUserRoles(app.pg, user.id);
+      const isAdmin = roles.includes('admin');
 
       const { id } = request.params;
 
@@ -1629,8 +1718,9 @@ async function booksRoutes(app) {
         return reply.code(404).send({ message: 'Book not found' });
       }
 
-      const result = await app.pg.query(
-        `SELECT 
+      // Build query with access check for non-admin users
+      let query = `
+        SELECT 
           b.id,
           b.name,
           b.description,
@@ -1664,9 +1754,25 @@ async function booksRoutes(app) {
         INNER JOIN public.users u ON b.owner_user_id = u.id
         LEFT JOIN public.user_details ud ON u.id = ud.user_id
         LEFT JOIN public.businesses biz ON b.business_id = biz.id
-        WHERE b.id = $1`,
-        [id]
-      );
+        WHERE b.id = $1
+      `;
+
+      const params = [id];
+
+      // For non-admin users, check if they have access to the book (owner or member)
+      if (!isAdmin) {
+        query += ` AND (
+          b.owner_user_id = $2 OR
+          EXISTS (
+            SELECT 1 FROM public.book_users bu 
+            WHERE bu.book_id = b.id AND bu.user_id = $2
+          )
+        )`;
+        params.push(user.id);
+        request.log.info({ userId: user.id, email: user.email, bookId: id }, 'Checking book access for non-admin user');
+      }
+
+      const result = await app.pg.query(query, params);
 
       if (result.rows.length === 0) {
         return reply.code(404).send({ message: 'Book not found' });
@@ -2393,6 +2499,39 @@ async function booksRoutes(app) {
         query += ` ORDER BY e.entry_date DESC, e.entry_time DESC`;
       }
 
+      // First, get ALL entries for the book (no filters) to calculate running balance correctly
+      // This ensures balance is calculated from all entries chronologically, not just filtered ones
+      const allEntriesQuery = `
+        SELECT 
+          e.id,
+          e.entry_type,
+          e.amount,
+          e.entry_date,
+          e.entry_time,
+          e.created_at,
+          SUM(
+            CASE 
+              WHEN e.entry_type = 'cash_in' THEN e.amount
+              WHEN e.entry_type = 'cash_out' THEN -e.amount
+              ELSE 0
+            END
+          ) OVER (
+            PARTITION BY e.book_id 
+            ORDER BY e.entry_date ASC, e.entry_time ASC, e.created_at ASC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) as balance
+        FROM public.entries e
+        WHERE e.book_id = $1
+        ORDER BY e.entry_date ASC, e.entry_time ASC, e.created_at ASC
+      `;
+      
+      const allEntriesResult = await app.pg.query(allEntriesQuery, [bookId]);
+      const balanceMap = new Map();
+      allEntriesResult.rows.forEach(entry => {
+        balanceMap.set(entry.id, entry.balance);
+      });
+
+      // Now get filtered entries for display
       const result = await app.pg.query(query, queryParams);
       const entries = result.rows;
 
@@ -2513,19 +2652,13 @@ async function booksRoutes(app) {
         });
       } else {
         // All entries - show individual entries with running balance
-        processedEntries = entries.map(entry => {
-          if (entry.entry_type === 'cash_in') {
-            runningBalance += parseFloat(entry.amount);
-          } else {
-            runningBalance -= parseFloat(entry.amount);
-          }
-          return {
-            ...entry,
-            balance: runningBalance,
-            hasAttachment: entry.has_attachment,
-            isSummary: false
-          };
-        });
+        // Use the balance from balanceMap which was calculated from ALL entries chronologically
+        processedEntries = entries.map(entry => ({
+          ...entry,
+          balance: balanceMap.get(entry.id) || 0,
+          hasAttachment: entry.has_attachment,
+          isSummary: false
+        }));
       }
 
       // Get user details for generated by

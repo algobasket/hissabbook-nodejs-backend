@@ -243,6 +243,13 @@ async function authRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
+      // Check if user has permission to edit account info
+      const { hasPermission } = require('../services/userService');
+      const canEditInfo = await hasPermission(app.pg, user.id, 'accounts.edit_info');
+      if (!canEditInfo) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to edit account information.' });
+      }
+
       const { name, firstName, lastName, gstin, phone, upiId, upiQrCode } = request.body;
 
       // Get existing details to check for old QR code
@@ -356,6 +363,13 @@ async function authRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
+      // Check if user has permission to change password
+      const { hasPermission } = require('../services/userService');
+      const canChangePassword = await hasPermission(app.pg, user.id, 'accounts.change_password');
+      if (!canChangePassword) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to change password.' });
+      }
+
       const { newPassword } = request.body;
 
       // Hash new password
@@ -399,6 +413,13 @@ async function authRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
+      // Check if user has permission to change email
+      const { hasPermission } = require('../services/userService');
+      const canChangeEmail = await hasPermission(app.pg, user.id, 'accounts.change_email');
+      if (!canChangeEmail) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to change email.' });
+      }
+
       const { newEmail } = request.body;
 
       // Check if email is already in use
@@ -434,6 +455,13 @@ async function authRoutes(app) {
       const user = await findUserByEmail(app.pg, request.user.email);
       if (!user) {
         return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Check if user has permission to verify email
+      const { hasPermission } = require('../services/userService');
+      const canVerifyEmail = await hasPermission(app.pg, user.id, 'accounts.verify_email');
+      if (!canVerifyEmail) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to verify email.' });
       }
 
       if (user.is_email_verified) {

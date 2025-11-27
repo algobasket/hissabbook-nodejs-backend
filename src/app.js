@@ -20,6 +20,7 @@ const subscriptionsRoutes = require('./routes/subscriptions');
 async function buildApp() {
   const app = fastify({
     logger: true,
+    bodyLimit: 50 * 1024 * 1024, // 50MB limit for large image uploads
   }); 
 
   await app.register(cors, {

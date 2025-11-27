@@ -679,7 +679,7 @@ async function businessesRoutes(app) {
       }
 
       const { id } = request.params;
-      const { email, phone, role } = request.body;
+      const { email, phone, role, cashbookId } = request.body;
 
       // Validate that either email or phone is provided
       if (!email && !phone) {
@@ -780,7 +780,11 @@ async function businessesRoutes(app) {
 
       // Generate invite link
       const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
-      const inviteLink = `${baseUrl}/invite?token=${inviteToken}&business=${id}&email=${encodeURIComponent(email || phone || '')}&role=${role}`;
+      let inviteLink = `${baseUrl}/invite?token=${inviteToken}&business=${id}&email=${encodeURIComponent(email || phone || '')}&role=${role}`;
+      // Add cashbookId to invite link if provided (for Staff invites from specific books)
+      if (cashbookId) {
+        inviteLink += `&cashbook=${cashbookId}`;
+      }
 
       // Send invite email if email is provided
       if (email) {

@@ -281,12 +281,12 @@ async function invitesRoutes(app) {
         return reply.code(404).send({ message: 'Invite not found' });
       }
 
-      // Find invite by token
+      // Find invite by token (allow both pending and accepted invites)
       const inviteResult = await app.pg.query(
         `SELECT bi.*, b.name as business_name, b.owner_user_id
          FROM public.business_invites bi
          INNER JOIN public.businesses b ON bi.business_id = b.id
-         WHERE bi.invite_token = $1 AND bi.status = 'pending'`,
+         WHERE bi.invite_token = $1 AND bi.status IN ('pending', 'accepted')`,
         [token]
       );
 
@@ -306,11 +306,11 @@ async function invitesRoutes(app) {
         return reply.code(403).send({ message: 'This invite is for a different email address' });
       }
 
-      // Update invite status to accepted
+      // Update invite status to accepted (only if it's still pending)
       await app.pg.query(
         `UPDATE public.business_invites 
-         SET status = 'accepted', accepted_at = now(), accepted_by = $1, updated_at = now()
-         WHERE invite_token = $2`,
+         SET status = 'accepted', accepted_at = COALESCE(accepted_at, now()), accepted_by = COALESCE(accepted_by, $1), updated_at = now()
+         WHERE invite_token = $2 AND status = 'pending'`,
         [user.id, token]
       );
 
@@ -333,6 +333,63 @@ async function invitesRoutes(app) {
            DO UPDATE SET status = 'active', updated_at = now()`,
           [user.id, invite.id, invite.business_id, invite.role]
         );
+      }
+
+      // If role is Staff and there's a cashbookId in the request, add user to that book
+      const { cashbookId } = request.body;
+      if (invite.role === 'Staff' && cashbookId) {
+        try {
+          // Check if book_users table exists
+          const bookUsersTableCheck = await app.pg.query(`
+            SELECT EXISTS (
+              SELECT FROM information_schema.tables 
+              WHERE table_schema = 'public' 
+              AND table_name = 'book_users'
+            );
+          `);
+
+          if (bookUsersTableCheck.rows[0]?.exists) {
+            // Check if book exists
+            const bookCheck = await app.pg.query(
+              'SELECT id, business_id FROM public.books WHERE id = $1',
+              [cashbookId]
+            );
+
+            if (bookCheck.rows.length > 0) {
+              const book = bookCheck.rows[0];
+              // Verify book belongs to the business from the invite (or allow if book has no business_id)
+              if (!book.business_id || book.business_id === invite.business_id) {
+                // Add user to book (using ON CONFLICT to handle duplicates gracefully)
+                const result = await app.pg.query(
+                  `INSERT INTO public.book_users (book_id, user_id, added_by)
+                   VALUES ($1, $2, $3)
+                   ON CONFLICT (book_id, user_id) DO NOTHING
+                   RETURNING id`,
+                  [cashbookId, user.id, invite.invited_by || user.id]
+                );
+                
+                if (result.rows.length > 0) {
+                  request.log.info({ bookId: cashbookId, userId: user.id }, 'User added to book after accepting invite');
+                } else {
+                  request.log.info({ bookId: cashbookId, userId: user.id }, 'User already exists in book');
+                }
+              } else {
+                request.log.warn({ 
+                  bookId: cashbookId, 
+                  bookBusinessId: book.business_id, 
+                  inviteBusinessId: invite.business_id 
+                }, 'Book business_id does not match invite business_id');
+              }
+            } else {
+              request.log.warn({ cashbookId }, 'Book not found when trying to add user after invite acceptance');
+            }
+          } else {
+            request.log.warn('book_users table does not exist');
+          }
+        } catch (bookError) {
+          // Log error but don't fail the invite acceptance
+          request.log.error({ err: bookError, cashbookId }, 'Error adding user to book after invite acceptance');
+        }
       }
 
       // If role is Partner, we need to create a book for them

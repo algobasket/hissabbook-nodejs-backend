@@ -209,22 +209,42 @@ async function payoutRequestRoutes(app) {
           return reply.send({ payoutRequests: [] });
         }
       }
-      // For managers, filter by staff they created
+      // For managers, filter by staff who are members of their books OR staff they created
       else if (isManager && !isAdmin) {
-        // Get all staff users created by this manager
-        const staffResult = await app.pg.query(
+        // Get all books owned by this manager
+        const booksResult = await app.pg.query(
+          `SELECT id FROM public.books WHERE owner_user_id = $1`,
+          [user.id]
+        );
+        const bookIds = booksResult.rows.map(b => b.id);
+
+        // Get all staff users who are members of manager's books
+        let staffUserIds = [];
+        if (bookIds.length > 0) {
+          const bookMembersResult = await app.pg.query(
+            `SELECT DISTINCT user_id FROM public.book_users WHERE book_id = ANY($1::uuid[])`,
+            [bookIds]
+          );
+          staffUserIds = bookMembersResult.rows.map(m => m.user_id);
+        }
+
+        // Also include staff directly created by this manager
+        const createdStaffResult = await app.pg.query(
           `SELECT id FROM public.users WHERE created_by = $1`,
           [user.id]
         );
-        const staffUserIds = staffResult.rows.map(s => s.id);
+        const createdStaffIds = createdStaffResult.rows.map(s => s.id);
+        
+        // Combine both sets of user IDs (remove duplicates)
+        const allStaffUserIds = [...new Set([...staffUserIds, ...createdStaffIds])];
 
-        if (staffUserIds.length > 0) {
+        if (allStaffUserIds.length > 0) {
           // Filter payout requests by staff user IDs
           query += ' WHERE pr.user_id = ANY($' + paramIndex + '::uuid[])';
-          params.push(staffUserIds);
+          params.push(allStaffUserIds);
           paramIndex++;
         } else {
-          // No staff created by this manager, return empty result
+          // No staff members in manager's books, return empty result
           return reply.send({ payoutRequests: [] });
         }
       }
@@ -294,7 +314,7 @@ async function payoutRequestRoutes(app) {
     }
   });
 
-  // Delete payout request (admin only) - must be before /:id/status route
+  // Delete payout request - must be before /:id/status route
   app.delete('/:id', {
     preValidation: [app.authenticate],
   }, async (request, reply) => {
@@ -302,6 +322,12 @@ async function payoutRequestRoutes(app) {
       const user = await findUserByEmail(app.pg, request.user.email);
       if (!user) {
         return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Check if user has permission to delete payouts
+      const canDelete = await hasPermission(app.pg, user.id, 'payouts.delete');
+      if (!canDelete) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to delete payout requests.' });
       }
 
       const roles = await getUserRoles(app.pg, user.id);
@@ -322,17 +348,37 @@ async function payoutRequestRoutes(app) {
 
       const payoutRequest = existing.rows[0];
 
-      // Check permissions: admin can delete any, staff can delete their own, managers can delete their staff's requests
+      // Additional access checks: admin can delete any, staff can delete their own, managers can delete their staff's requests
       if (!isAdmin) {
         if (payoutRequest.user_id === user.id) {
           // User owns this payout request - allow deletion
         } else if (isManager) {
-          // Check if this payout request belongs to a staff member created by this manager
-          const staffCheck = await app.pg.query(
+          // Check if this payout request belongs to a staff member who is in manager's books
+          // Get all books owned by this manager
+          const booksResult = await app.pg.query(
+            `SELECT id FROM public.books WHERE owner_user_id = $1`,
+            [user.id]
+          );
+          const bookIds = booksResult.rows.map(b => b.id);
+
+          // Check if staff is a member of any of manager's books
+          let isStaffMember = false;
+          if (bookIds.length > 0) {
+            const bookMemberCheck = await app.pg.query(
+              `SELECT 1 FROM public.book_users WHERE book_id = ANY($1::uuid[]) AND user_id = $2 LIMIT 1`,
+              [bookIds, payoutRequest.user_id]
+            );
+            isStaffMember = bookMemberCheck.rows.length > 0;
+          }
+
+          // Also check if staff was created by this manager
+          const createdStaffCheck = await app.pg.query(
             'SELECT id FROM public.users WHERE id = $1 AND created_by = $2',
             [payoutRequest.user_id, user.id]
           );
-          if (staffCheck.rows.length === 0) {
+          const isCreatedStaff = createdStaffCheck.rows.length > 0;
+
+          if (!isStaffMember && !isCreatedStaff) {
             return reply.code(403).send({ message: 'Access denied. You can only delete your own payout requests or those from your staff members.' });
           }
         } else {
@@ -450,15 +496,34 @@ async function payoutRequestRoutes(app) {
 
       const payoutRequest = existing.rows[0];
 
-      // For managers (not admin), verify they created the staff who made the payout request
+      // For managers (not admin), verify the staff who made the payout request is in their books or was created by them
       if (isManager && !isAdmin && payoutRequest.user_id) {
-        const staffCheck = await app.pg.query(
+        // Get all books owned by this manager
+        const booksResult = await app.pg.query(
+          `SELECT id FROM public.books WHERE owner_user_id = $1`,
+          [user.id]
+        );
+        const bookIds = booksResult.rows.map(b => b.id);
+
+        // Check if staff is a member of any of manager's books
+        let isStaffMember = false;
+        if (bookIds.length > 0) {
+          const bookMemberCheck = await app.pg.query(
+            `SELECT 1 FROM public.book_users WHERE book_id = ANY($1::uuid[]) AND user_id = $2 LIMIT 1`,
+            [bookIds, payoutRequest.user_id]
+          );
+          isStaffMember = bookMemberCheck.rows.length > 0;
+        }
+
+        // Also check if staff was created by this manager
+        const createdStaffCheck = await app.pg.query(
           'SELECT id FROM public.users WHERE id = $1 AND created_by = $2',
           [payoutRequest.user_id, user.id]
         );
-        
-        if (staffCheck.rows.length === 0) {
-          return reply.code(403).send({ message: 'Access denied. You can only approve payout requests from staff you created.' });
+        const isCreatedStaff = createdStaffCheck.rows.length > 0;
+
+        if (!isStaffMember && !isCreatedStaff) {
+          return reply.code(403).send({ message: 'Access denied. You can only approve payout requests from staff who are members of your books.' });
         }
       }
 
@@ -487,192 +552,333 @@ async function payoutRequestRoutes(app) {
           [status, id]
         );
 
-        // If accepted, create a Cash-Out entry in Payout Book
+        // If accepted, create a Cash-Out entry in the specified book or Payout Book
         if (status === 'accepted') {
           // If no user_id, skip entry creation but still update status
           if (!payoutRequest.user_id) {
             request.log.warn({ payout_request_id: id }, 'Payout request accepted but no user_id, skipping entry creation');
           } else {
-            // Get the staff user who created the payout request
-            const staffUserResult = await client.query(
-              'SELECT id, created_by FROM public.users WHERE id = $1',
-              [payoutRequest.user_id]
-            );
+            let targetBookId = null;
 
-            if (staffUserResult.rows.length === 0) {
-              request.log.warn({ payout_request_id: id, user_id: payoutRequest.user_id }, 'Staff user not found, skipping entry creation');
-            } else {
-              const staffUser = staffUserResult.rows[0];
-              const managerId = staffUser.created_by || user.id; // Fallback to current user if no created_by
-
-              // Get manager's business (first business owned by manager)
-              const businessResult = await client.query(
-                `SELECT id FROM public.businesses 
-                 WHERE owner_user_id = $1 
-                 ORDER BY created_at ASC 
-                 LIMIT 1`,
-                [managerId]
+            // If book_id is provided in payout request, use that book
+            if (payoutRequest.book_id) {
+              // Verify the book exists and user has access to it
+              const bookCheck = await client.query(
+                `SELECT b.id, b.owner_user_id, b.business_id 
+                 FROM public.books b
+                 WHERE b.id = $1`,
+                [payoutRequest.book_id]
               );
 
-              if (businessResult.rows.length === 0) {
-                request.log.warn({ payout_request_id: id, manager_id: managerId }, 'Manager business not found, skipping entry creation');
-              } else {
-                const businessId = businessResult.rows[0].id;
+              if (bookCheck.rows.length > 0) {
+                const book = bookCheck.rows[0];
+                // Check if user has access to this book (owner, admin, or member)
+                const isBookOwner = book.owner_user_id === user.id;
+                const isBookMember = await client.query(
+                  'SELECT 1 FROM public.book_users WHERE book_id = $1 AND user_id = $2',
+                  [payoutRequest.book_id, user.id]
+                );
 
-                // Find or create "Payout Book" for this business
-                let payoutBookResult = await client.query(
-                  `SELECT id FROM public.books 
-                   WHERE business_id = $1 AND LOWER(name) = 'payout book'
+                if (isAdmin || isBookOwner || isBookMember.rows.length > 0) {
+                  targetBookId = payoutRequest.book_id;
+                  request.log.info({ payout_request_id: id, book_id: targetBookId }, 'Using specified book from payout request');
+                } else {
+                  request.log.warn({ payout_request_id: id, book_id: payoutRequest.book_id }, 'User does not have access to specified book, will use Payout Book');
+                }
+              } else {
+                request.log.warn({ payout_request_id: id, book_id: payoutRequest.book_id }, 'Specified book not found, will use Payout Book');
+              }
+            }
+
+            // If no target book yet, find the book the staff member belongs to
+            if (!targetBookId) {
+              // Get all books owned by the manager (current user approving)
+              const managerBooksResult = await client.query(
+                `SELECT id FROM public.books WHERE owner_user_id = $1`,
+                [user.id]
+              );
+              const managerBookIds = managerBooksResult.rows.map(b => b.id);
+
+              if (managerBookIds.length > 0) {
+                // Find which book(s) the staff member is a member of
+                const staffBooksResult = await client.query(
+                  `SELECT book_id FROM public.book_users 
+                   WHERE book_id = ANY($1::uuid[]) AND user_id = $2
+                   ORDER BY added_at ASC`,
+                  [managerBookIds, payoutRequest.user_id]
+                );
+
+                if (staffBooksResult.rows.length > 0) {
+                  // Staff is a member of at least one book
+                  // If book_id was provided in payout request but wasn't valid, prefer it if staff is a member
+                  if (payoutRequest.book_id && staffBooksResult.rows.some(r => r.book_id === payoutRequest.book_id)) {
+                    targetBookId = payoutRequest.book_id;
+                    request.log.info({ payout_request_id: id, book_id: targetBookId }, 'Using book from payout request (staff is member)');
+                  } else {
+                    // Use the first book the staff is a member of
+                    targetBookId = staffBooksResult.rows[0].book_id;
+                    request.log.info({ payout_request_id: id, book_id: targetBookId }, 'Using staff member book for cashout entry');
+                  }
+                } else {
+                  // Staff is not a member of any book owned by manager, fall back to Payout Book
+                  request.log.warn({ payout_request_id: id, user_id: payoutRequest.user_id }, 'Staff is not a member of any manager book, falling back to Payout Book');
+                  
+                  // Get manager's business (first business owned by manager)
+                  const businessResult = await client.query(
+                    `SELECT id FROM public.businesses 
+                     WHERE owner_user_id = $1 
+                     ORDER BY created_at ASC 
+                     LIMIT 1`,
+                    [user.id]
+                  );
+
+                  if (businessResult.rows.length > 0) {
+                    const businessId = businessResult.rows[0].id;
+
+                    // Find or create "Payout Book" for this business
+                    let payoutBookResult = await client.query(
+                      `SELECT id FROM public.books 
+                       WHERE business_id = $1 AND LOWER(name) = 'payout book'
+                       ORDER BY created_at ASC 
+                       LIMIT 1`,
+                      [businessId]
+                    );
+
+                    if (payoutBookResult.rows.length > 0) {
+                      targetBookId = payoutBookResult.rows[0].id;
+                    } else {
+                      // Create Payout Book if it doesn't exist
+                      const createBookResult = await client.query(
+                        `INSERT INTO public.books (name, description, owner_user_id, business_id, currency_code)
+                         VALUES ($1, $2, $3, $4, $5)
+                         RETURNING id`,
+                        ['Payout Book', 'Payout requests cash out entries', user.id, businessId, 'INR']
+                      );
+                      targetBookId = createBookResult.rows[0].id;
+                      request.log.info({ payout_book_id: targetBookId, business_id: businessId }, 'Created Payout Book as fallback');
+                    }
+                  } else {
+                    request.log.warn({ payout_request_id: id, manager_id: user.id }, 'Manager business not found, skipping entry creation');
+                  }
+                }
+              } else {
+                // Manager has no books, fall back to Payout Book
+                request.log.warn({ payout_request_id: id, manager_id: user.id }, 'Manager has no books, falling back to Payout Book');
+                
+                // Get manager's business (first business owned by manager)
+                const businessResult = await client.query(
+                  `SELECT id FROM public.businesses 
+                   WHERE owner_user_id = $1 
                    ORDER BY created_at ASC 
                    LIMIT 1`,
-                  [businessId]
+                  [user.id]
                 );
 
-                let payoutBookId;
-                if (payoutBookResult.rows.length > 0) {
-                  payoutBookId = payoutBookResult.rows[0].id;
-                } else {
-                  // Create Payout Book if it doesn't exist
-                  const createBookResult = await client.query(
-                    `INSERT INTO public.books (name, description, owner_user_id, business_id, currency_code)
-                     VALUES ($1, $2, $3, $4, $5)
-                     RETURNING id`,
-                    ['Payout Book', 'Payout requests cash out entries', managerId, businessId, 'INR']
+                if (businessResult.rows.length > 0) {
+                  const businessId = businessResult.rows[0].id;
+
+                  // Find or create "Payout Book" for this business
+                  let payoutBookResult = await client.query(
+                    `SELECT id FROM public.books 
+                     WHERE business_id = $1 AND LOWER(name) = 'payout book'
+                     ORDER BY created_at ASC 
+                     LIMIT 1`,
+                    [businessId]
                   );
-                  payoutBookId = createBookResult.rows[0].id;
-                  request.log.info({ payout_book_id: payoutBookId, business_id: businessId }, 'Created Payout Book');
+
+                  if (payoutBookResult.rows.length > 0) {
+                    targetBookId = payoutBookResult.rows[0].id;
+                  } else {
+                    // Create Payout Book if it doesn't exist
+                    const createBookResult = await client.query(
+                      `INSERT INTO public.books (name, description, owner_user_id, business_id, currency_code)
+                       VALUES ($1, $2, $3, $4, $5)
+                       RETURNING id`,
+                      ['Payout Book', 'Payout requests cash out entries', user.id, businessId, 'INR']
+                    );
+                    targetBookId = createBookResult.rows[0].id;
+                    request.log.info({ payout_book_id: targetBookId, business_id: businessId }, 'Created Payout Book as fallback');
+                  }
+                } else {
+                  request.log.warn({ payout_request_id: id, manager_id: user.id }, 'Manager business not found, skipping entry creation');
                 }
+              }
+            }
 
-                // Get staff user details for entry
-                const staffDetailsResult = await client.query(
-                  `SELECT first_name, last_name, email FROM public.user_details ud
-                   JOIN public.users u ON ud.user_id = u.id
-                   WHERE u.id = $1`,
-                  [payoutRequest.user_id]
-                );
+            // Create entry in the target book if we have one
+            if (targetBookId) {
+              // Get staff user details for entry
+              const staffDetailsResult = await client.query(
+                `SELECT first_name, last_name, email FROM public.user_details ud
+                 JOIN public.users u ON ud.user_id = u.id
+                 WHERE u.id = $1`,
+                [payoutRequest.user_id]
+              );
 
-                const staffName = staffDetailsResult.rows.length > 0
-                  ? [staffDetailsResult.rows[0].first_name, staffDetailsResult.rows[0].last_name].filter(Boolean).join(' ').trim() || staffDetailsResult.rows[0].email?.split('@')[0] || 'Staff'
-                  : 'Staff';
+              const staffName = staffDetailsResult.rows.length > 0
+                ? [staffDetailsResult.rows[0].first_name, staffDetailsResult.rows[0].last_name].filter(Boolean).join(' ').trim() || staffDetailsResult.rows[0].email?.split('@')[0] || 'Staff'
+                : 'Staff';
 
-                // Create Cash-Out entry in Payout Book
-                const now = new Date();
-                const entryDate = now.toISOString().split('T')[0]; // YYYY-MM-DD
-                const entryTime = now.toTimeString().split(' ')[0]; // HH:MM:SS
+              // Create Cash-Out entry in the target book
+              const now = new Date();
+              const entryDate = now.toISOString().split('T')[0]; // YYYY-MM-DD
+              const entryTime = now.toTimeString().split(' ')[0]; // HH:MM:SS
 
-                const entryResult = await client.query(
-                  `INSERT INTO public.entries (
-                    book_id, entry_type, amount, party_name, 
-                    payment_mode, remarks, entry_date, entry_time, created_by
-                  )
-                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                  RETURNING id`,
-                  [
-                    payoutBookId,
-                    'cash_out',
-                    payoutRequest.amount,
-                    staffName, // Party name = staff who requested
-                    'UPI', // Payment mode
-                    `Payout Request: ${payoutRequest.utr} - ${payoutRequest.remarks}${notes ? ` | Notes: ${notes}` : ''}`,
-                    entryDate,
-                    entryTime,
-                    user.id, // Created by the manager who approved
-                  ]
-                );
+              const entryResult = await client.query(
+                `INSERT INTO public.entries (
+                  book_id, entry_type, amount, party_name, 
+                  payment_mode, remarks, entry_date, entry_time, created_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING id`,
+                [
+                  targetBookId,
+                  'cash_out',
+                  payoutRequest.amount,
+                  staffName, // Party name = staff who requested
+                  'UPI', // Payment mode
+                  `Payout Request: ${payoutRequest.utr} - ${payoutRequest.remarks}${notes ? ` | Notes: ${notes}` : ''}`,
+                  entryDate,
+                  entryTime,
+                  user.id, // Created by the manager who approved
+                ]
+              );
 
-                const entryId = entryResult.rows[0].id;
+              const entryId = entryResult.rows[0].id;
 
-                // Link the proof file from payout request to the entry attachment if it exists
-                if (payoutRequest.proof_filename) {
-                  try {
+              // Link the proof file from payout request to the entry attachment if it exists
+              if (payoutRequest.proof_filename) {
+                try {
                     const uploadDir = path.join(process.cwd(), 'uploads');
                     const proofPath = path.join(uploadDir, payoutRequest.proof_filename);
                     
+                    request.log.info({
+                      entry_id: entryId,
+                      proof_filename: payoutRequest.proof_filename,
+                      proof_path: proofPath,
+                      upload_dir: uploadDir,
+                    }, 'Attempting to link payout proof file to cash-out entry');
+                    
                     // Check if file exists and get file stats
                     let fileStats;
+                    let fileExists = false;
                     try {
                       fileStats = await fs.stat(proofPath);
+                      fileExists = true;
+                      request.log.info({
+                        proof_path: proofPath,
+                        file_size: fileStats.size,
+                        file_exists: true,
+                      }, 'Proof file found');
                     } catch (err) {
-                      request.log.warn({ proof_path: proofPath }, 'Proof file not found, skipping attachment creation');
+                      request.log.warn({ 
+                        proof_path: proofPath,
+                        error: err.message,
+                        error_code: err.code,
+                      }, 'Proof file not found at expected path, will create attachment record anyway');
                       fileStats = null;
+                      fileExists = false;
                     }
 
-                    if (fileStats) {
-                      // Determine file type and mime type from filename
-                      const fileNameParts = payoutRequest.proof_filename.split('.');
-                      const fileExtension = (fileNameParts.length > 1 ? fileNameParts.pop() : '').toLowerCase();
-                      const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(fileExtension);
-                      const isPdf = fileExtension === 'pdf';
-                      const fileType = isImage ? 'image' : (isPdf ? 'pdf' : 'document');
-                      
-                      // Determine mime type
-                      const mimeTypes = {
-                        'jpg': 'image/jpeg',
-                        'jpeg': 'image/jpeg',
-                        'png': 'image/png',
-                        'gif': 'image/gif',
-                        'webp': 'image/webp',
-                        'pdf': 'application/pdf',
-                      };
-                      const mimeType = mimeTypes[fileExtension] || 'application/octet-stream';
+                    // Determine file type and mime type from filename
+                    const fileNameParts = payoutRequest.proof_filename.split('.');
+                    const fileExtension = (fileNameParts.length > 1 ? fileNameParts.pop() : '').toLowerCase();
+                    const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(fileExtension);
+                    const isPdf = fileExtension === 'pdf';
+                    const fileType = isImage ? 'image' : (isPdf ? 'pdf' : 'document');
+                    
+                    // Determine mime type
+                    const mimeTypes = {
+                      'jpg': 'image/jpeg',
+                      'jpeg': 'image/jpeg',
+                      'png': 'image/png',
+                      'gif': 'image/gif',
+                      'webp': 'image/webp',
+                      'pdf': 'application/pdf',
+                    };
+                    const mimeType = mimeTypes[fileExtension] || 'application/octet-stream';
 
-                      // Create entry attachment linking to the proof file
-                      await client.query(
-                        `INSERT INTO public.entry_attachments (
-                          entry_id, book_id, file_name, file_path, file_type, file_size, mime_type
-                        )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                        [
-                          entryId,
-                          payoutBookId,
-                          payoutRequest.proof_filename,
-                          proofPath,
-                          fileType,
-                          fileStats.size,
-                          mimeType,
-                        ]
-                      );
+                    // Create entry attachment linking to the proof file
+                    // Use file size from stats if available, otherwise use 0
+                    const fileSize = fileStats ? fileStats.size : 0;
+                    
+                    // Store just the filename in file_path (not full system path)
+                    // The API will construct the URL as /uploads/${filename}
+                    const filePathForDb = payoutRequest.proof_filename;
+                    
+                    const attachmentResult = await client.query(
+                      `INSERT INTO public.entry_attachments (
+                        entry_id, book_id, file_name, file_path, file_type, file_size, mime_type
+                      )
+                      VALUES ($1, $2, $3, $4, $5, $6, $7)
+                      RETURNING id, file_name, file_path`,
+                      [
+                        entryId,
+                        targetBookId,
+                        payoutRequest.proof_filename,
+                        filePathForDb, // Store just filename, not full path
+                        fileType,
+                        fileSize,
+                        mimeType,
+                      ]
+                    );
 
+                    if (attachmentResult.rows.length > 0) {
                       request.log.info({
                         entry_id: entryId,
+                        attachment_id: attachmentResult.rows[0].id,
                         proof_filename: payoutRequest.proof_filename,
-                      }, 'Linked payout proof file to cash-out entry');
+                        book_id: targetBookId,
+                        file_path: proofPath,
+                        file_exists: fileExists,
+                        file_size: fileSize,
+                      }, 'Successfully created entry attachment for payout proof');
+                    } else {
+                      request.log.error({
+                        entry_id: entryId,
+                        proof_filename: payoutRequest.proof_filename,
+                      }, 'Failed to create attachment - no row returned from INSERT');
                     }
                   } catch (attachmentError) {
                     // Log error but don't fail the transaction
                     request.log.error({ 
                       err: attachmentError,
+                      stack: attachmentError.stack,
                       entry_id: entryId,
                       proof_filename: payoutRequest.proof_filename,
+                      book_id: targetBookId,
                     }, 'Failed to create entry attachment for payout proof');
                   }
-                }
-
-                // Update wallet balance if wallet exists (decrease balance for cash-out)
-                const walletResult = await client.query(
-                  'SELECT id FROM public.user_wallets WHERE user_id = $1',
-                  [payoutRequest.user_id]
-                );
-                const walletId = walletResult.rows.length > 0 ? walletResult.rows[0].id : null;
-
-                if (walletId) {
-                  await client.query(
-                    `UPDATE public.user_wallets 
-                     SET balance = balance - $1, updated_at = now()
-                     WHERE id = $2`,
-                    [payoutRequest.amount, walletId]
-                  );
-                }
-
-                request.log.info({
+              } else {
+                request.log.warn({
+                  entry_id: entryId,
                   payout_request_id: id,
-                  user_id: payoutRequest.user_id,
-                  amount: payoutRequest.amount,
-                  payout_book_id: payoutBookId,
-                  business_id: businessId,
-                  wallet_id: walletId,
-                }, 'Cash-Out entry created in Payout Book for accepted payout request');
+                }, 'No proof_filename in payout request, skipping attachment creation');
               }
+
+              // Update wallet balance if wallet exists (decrease balance for cash-out)
+              const walletResult = await client.query(
+                'SELECT id FROM public.user_wallets WHERE user_id = $1',
+                [payoutRequest.user_id]
+              );
+              const walletId = walletResult.rows.length > 0 ? walletResult.rows[0].id : null;
+
+              if (walletId) {
+                await client.query(
+                  `UPDATE public.user_wallets 
+                   SET balance = balance - $1, updated_at = now()
+                   WHERE id = $2`,
+                  [payoutRequest.amount, walletId]
+                );
+              }
+
+              request.log.info({
+                payout_request_id: id,
+                user_id: payoutRequest.user_id,
+                amount: payoutRequest.amount,
+                book_id: targetBookId,
+                wallet_id: walletId,
+              }, 'Cash-Out entry created in book for accepted payout request');
             }
           }
         }

@@ -55,6 +55,35 @@ async function usersRoutes(app) {
     }
   });
 
+  // Get current user's permissions
+  app.get('/users/me/permissions', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      const permissions = await getUserPermissions(app.pg, user.id);
+      
+      return reply.send({
+        permissions: permissions,
+      });
+    } catch (error) {
+      request.log.error({ 
+        err: error, 
+        stack: error.stack,
+        message: error.message,
+      }, 'Failed to fetch user permissions');
+      
+      return reply.code(500).send({ 
+        message: 'Failed to fetch user permissions', 
+        error: error.message,
+      });
+    }
+  });
+
   // Get admin users
   app.get('/users/admin', { preValidation: [app.authenticate] }, async (request, reply) => {
     try {
