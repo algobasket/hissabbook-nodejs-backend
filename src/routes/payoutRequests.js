@@ -57,6 +57,30 @@ async function payoutRequestRoutes(app) {
       }
 
       const proofFilename = await saveProofToDisk(proof);
+      
+      // Verify file was saved and log details for debugging
+      const uploadDir = path.join(process.cwd(), 'uploads');
+      const filePath = path.join(uploadDir, proofFilename);
+      try {
+        const fileStats = await fs.stat(filePath);
+        request.log.info({
+          proofFilename,
+          uploadDir,
+          filePath,
+          cwd: process.cwd(),
+          fileSize: fileStats.size,
+          fileExists: true
+        }, 'Payout proof file saved and verified');
+      } catch (statError) {
+        request.log.error({
+          proofFilename,
+          uploadDir,
+          filePath,
+          cwd: process.cwd(),
+          error: statError.message
+        }, 'Payout proof file save verification failed');
+        // Continue anyway - file might still be accessible
+      }
 
       // If book_id is provided, verify it exists and belongs to the user
       if (book_id) {

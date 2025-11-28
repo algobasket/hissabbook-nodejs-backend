@@ -66,24 +66,39 @@ async function buildApp() {
       let filePath = path.join(process.cwd(), 'uploads', filename);
       let fileBuffer;
       
+      request.log.info({
+        filename,
+        filePath,
+        cwd: process.cwd(),
+        requestUrl: request.url
+      }, 'Attempting to serve uploaded file');
+      
       try {
         fileBuffer = await fs.readFile(filePath);
+        request.log.info({ filename, filePath, size: fileBuffer.length }, 'File found and read successfully');
       } catch (error) {
         // If not found, try the api-system uploads directory
         if (error.code === 'ENOENT') {
           const apiSystemPath = path.join(process.cwd(), '..', 'hissabbook-api-system', 'uploads', filename);
+          request.log.info({ filename, tryingPath: apiSystemPath }, 'File not found in primary location, trying api-system directory');
           try {
             fileBuffer = await fs.readFile(apiSystemPath);
             request.log.info({ filename, path: apiSystemPath }, 'Serving file from api-system directory');
           } catch (apiSystemError) {
             // If still not found, return 404
             if (apiSystemError.code === 'ENOENT') {
-              request.log.warn({ filename, triedPaths: [filePath, apiSystemPath] }, 'File not found in any uploads directory');
-              return reply.code(404).send({ message: 'File not found' });
+              request.log.warn({ 
+                filename, 
+                triedPaths: [filePath, apiSystemPath],
+                cwd: process.cwd(),
+                error: apiSystemError.message
+              }, 'File not found in any uploads directory');
+              return reply.code(404).send({ message: 'File not found', filename, triedPaths: [filePath, apiSystemPath] });
             }
             throw apiSystemError;
           }
         } else {
+          request.log.error({ filename, filePath, error: error.message }, 'Error reading file');
           throw error;
         }
       }
