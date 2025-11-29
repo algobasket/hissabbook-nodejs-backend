@@ -484,7 +484,12 @@ async function authRoutes(app) {
       );
 
       // Generate verification link
-      const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+      let baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL;
+      if (!baseUrl) {
+        baseUrl = process.env.NODE_ENV === 'production' 
+          ? 'https://hissabbook.com' 
+          : 'http://localhost:3000';
+      }
       const verificationLink = `${baseUrl}/verify-email?token=${verificationToken}`;
 
       // Send verification email

@@ -728,7 +728,12 @@ async function businessesRoutes(app) {
         : invite.inviter_email?.split('@')[0] || 'Manager';
 
       // Generate invite link
-      const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+      let baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL;
+      if (!baseUrl) {
+        baseUrl = process.env.NODE_ENV === 'production' 
+          ? 'https://hissabbook.com' 
+          : 'http://localhost:3000';
+      }
       const inviteIdentifier = invite.email || invite.phone || '';
       const identifierParam = invite.email ? 'email' : 'phone';
       let inviteLink = `${baseUrl}/invite?token=${invite.invite_token}&business=${businessId}&${identifierParam}=${encodeURIComponent(inviteIdentifier)}&role=${invite.role}`;
@@ -1123,7 +1128,13 @@ async function businessesRoutes(app) {
       `);
 
       // Generate invite link first (needed for short URL creation)
-      const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+      // Get base URL from environment or use production default
+      let baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL;
+      if (!baseUrl) {
+        baseUrl = process.env.NODE_ENV === 'production' 
+          ? 'https://hissabbook.com' 
+          : 'http://localhost:3000';
+      }
       // For invite link, use email if available, otherwise use phone (but don't mix them)
       // Use normalized values from inviteData to ensure we don't use phone as email
       const inviteIdentifier = inviteData.email || inviteData.phone || '';

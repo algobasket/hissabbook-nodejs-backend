@@ -78,7 +78,27 @@ async function createShortUrl(pg, originalUrl, expiresAt = null) {
     [shortCode, originalUrl, expiresAt]
   );
   
-  const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+  // Get base URL from environment or construct from original URL
+  let baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL;
+  
+  // If not set, try to extract from original URL
+  if (!baseUrl && originalUrl) {
+    try {
+      const urlObj = new URL(originalUrl);
+      baseUrl = `${urlObj.protocol}//${urlObj.host}`;
+    } catch (e) {
+      // If URL parsing fails, fall back to default
+      baseUrl = 'http://localhost:3000';
+    }
+  }
+  
+  // Final fallback
+  if (!baseUrl) {
+    baseUrl = process.env.NODE_ENV === 'production' 
+      ? 'https://hissabbook.com' 
+      : 'http://localhost:3000';
+  }
+  
   const shortUrl = `${baseUrl}/s/${shortCode}`;
   
   return {
