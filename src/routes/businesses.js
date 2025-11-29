@@ -4,6 +4,8 @@
 const { findUserByEmail, getUserRoles, hasPermission } = require('../services/userService');
 const { generateAndSaveUpiQrCode } = require('../utils/qrcode');
 const { sendInviteEmail } = require('../utils/email');
+const { sendInviteSms } = require('../utils/sms');
+const { createShortUrl } = require('../utils/shortUrl');
 const crypto = require('crypto');
 
 async function businessesRoutes(app) {
@@ -591,6 +593,8 @@ async function businessesRoutes(app) {
           bi.updated_at,
           bi.accepted_at,
           bi.accepted_by,
+          bi.cashbook_id,
+          bi.short_url,
           ui.user_id as accepted_user_id,
           ui.status as user_invite_status,
           ui.accepted_at as user_accepted_at,
@@ -634,6 +638,8 @@ async function businessesRoutes(app) {
         acceptedBy: invite.accepted_by || invite.accepted_user_id,
         acceptedUserEmail: invite.accepted_user_email,
         userInviteStatus: invite.user_invite_status,
+        cashbookId: invite.cashbook_id || null,
+        shortUrl: invite.short_url || null,
       }));
 
       return reply.send({ invites });
@@ -646,6 +652,330 @@ async function businessesRoutes(app) {
       
       return reply.code(500).send({ 
         message: 'Failed to fetch invites',
+        error: error.message,
+      });
+    }
+  });
+
+  // Resend a business invite
+  app.post('/businesses/:businessId/invites/:inviteId/resend', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      const { businessId, inviteId } = request.params;
+
+      // Check if business exists
+      const businessResult = await app.pg.query(
+        'SELECT id, name, owner_user_id FROM public.businesses WHERE id = $1',
+        [businessId]
+      );
+
+      if (businessResult.rows.length === 0) {
+        return reply.code(404).send({ message: 'Business not found' });
+      }
+
+      const business = businessResult.rows[0];
+
+      // Only business owner or partner (book owner in this business) can resend invites
+      if (business.owner_user_id !== user.id) {
+        const partnerCheck = await app.pg.query(
+          'SELECT id FROM public.books WHERE business_id = $1 AND owner_user_id = $2 LIMIT 1',
+          [businessId, user.id]
+        );
+
+        if (partnerCheck.rows.length === 0) {
+          return reply.code(403).send({ message: 'Access denied. You can only resend invites for your own business or businesses where you are a partner.' });
+        }
+      }
+
+      // Ensure business_invites table exists
+      const invitesTableCheck = await app.pg.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = 'business_invites'
+        );
+      `);
+
+      if (!invitesTableCheck.rows[0]?.exists) {
+        return reply.code(404).send({ message: 'Invite system not configured' });
+      }
+
+      // Get the invite
+      const inviteResult = await app.pg.query(
+        `SELECT bi.*, u.email as inviter_email, ud.first_name as inviter_first_name, ud.last_name as inviter_last_name
+         FROM public.business_invites bi
+         LEFT JOIN public.users u ON bi.invited_by = u.id
+         LEFT JOIN public.user_details ud ON u.id = ud.user_id
+         WHERE bi.id = $1 AND bi.business_id = $2 AND bi.status = 'pending'`,
+        [inviteId, businessId]
+      );
+
+      if (inviteResult.rows.length === 0) {
+        return reply.code(404).send({ message: 'Invite not found or already accepted' });
+      }
+
+      const invite = inviteResult.rows[0];
+
+      // Get inviter name
+      const inviterName = invite.inviter_first_name && invite.inviter_last_name
+        ? `${invite.inviter_first_name} ${invite.inviter_last_name}`
+        : invite.inviter_email?.split('@')[0] || 'Manager';
+
+      // Generate invite link
+      const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+      const inviteIdentifier = invite.email || invite.phone || '';
+      const identifierParam = invite.email ? 'email' : 'phone';
+      let inviteLink = `${baseUrl}/invite?token=${invite.invite_token}&business=${businessId}&${identifierParam}=${encodeURIComponent(inviteIdentifier)}&role=${invite.role}`;
+      // Add cashbookId to invite link if present
+      if (invite.cashbook_id) {
+        inviteLink += `&cashbook=${invite.cashbook_id}`;
+      }
+
+      // Create short URL for SMS (if phone invite)
+      let shortUrlForSms = invite.short_url || null;
+      if (invite.phone && !shortUrlForSms) {
+        try {
+          // Set expiration to match invite expiration
+          const expiresAt = invite.expires_at ? new Date(invite.expires_at) : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+          const shortUrlData = await createShortUrl(app.pg, inviteLink, expiresAt);
+          shortUrlForSms = shortUrlData.shortUrl;
+          request.log.info({ 
+            shortCode: shortUrlData.shortCode, 
+            originalUrl: inviteLink,
+            shortUrl: shortUrlForSms
+          }, 'Created short URL for SMS resend');
+          
+          // Store short URL in database
+          await app.pg.query(
+            `UPDATE public.business_invites 
+             SET short_url = $1
+             WHERE id = $2`,
+            [shortUrlForSms, invite.id]
+          );
+        } catch (shortUrlError) {
+          request.log.error({ err: shortUrlError }, 'Failed to create short URL for resend, will use long URL');
+          // Continue with long URL if short URL creation fails
+        }
+      }
+
+      // Resend invite email ONLY if a valid email is provided
+      if (invite.email) {
+        try {
+          await sendInviteEmail({
+            email: invite.email,
+            businessName: business.name,
+            inviteLink,
+            role: invite.role,
+            inviterName,
+          });
+          request.log.info({ email: invite.email, businessName: business.name }, 'Invite email resent successfully');
+        } catch (emailError) {
+          request.log.error({ err: emailError }, 'Failed to resend invite email');
+          return reply.code(500).send({ 
+            message: 'Failed to resend invite email. Please check email configuration.',
+            error: emailError.message 
+          });
+        }
+      }
+
+      // Resend invite SMS ONLY if a valid phone is provided
+      let smsSent = false;
+      let smsErrorMessage = null;
+      
+      if (invite.phone) {
+        request.log.info({ 
+          phone: invite.phone, 
+          phoneType: typeof invite.phone,
+          phoneLength: invite.phone?.length,
+          businessName: business.name 
+        }, 'Attempting to resend invite SMS');
+        
+        try {
+          // Use short URL for SMS if available, otherwise use long URL
+          const smsLink = shortUrlForSms || inviteLink;
+          await sendInviteSms({
+            phone: invite.phone,
+            businessName: business.name,
+            inviteLink: smsLink,
+            role: invite.role,
+            inviterName,
+          });
+          smsSent = true;
+          request.log.info({ 
+            phone: invite.phone, 
+            businessName: business.name,
+            usedShortUrl: !!shortUrlForSms,
+            link: smsLink
+          }, 'Invite SMS resent successfully');
+        } catch (smsErrorCaught) {
+          smsErrorMessage = smsErrorCaught.message;
+          request.log.error({ 
+            err: smsErrorCaught, 
+            phone: invite.phone,
+            phoneType: typeof invite.phone,
+            message: smsErrorCaught.message,
+            stack: smsErrorCaught.stack
+          }, 'Failed to resend invite SMS');
+          // Don't throw - let the user know via the response message
+        }
+      } else {
+        request.log.warn({ 
+          inviteId: invite.id,
+          hasPhone: !!invite.phone,
+          phone: invite.phone
+        }, 'No phone number found in invite for SMS resend');
+      }
+
+      // Determine success message based on what was sent
+      let successMessage = 'Invite resent successfully';
+      if (invite.email && invite.phone) {
+        if (smsSent) {
+          successMessage = 'Invite resent successfully via email and SMS';
+        } else {
+          successMessage = smsErrorMessage 
+            ? `Invite resent via email, but SMS failed: ${smsErrorMessage}`
+            : 'Invite resent via email, but SMS could not be sent';
+        }
+      } else if (invite.email) {
+        successMessage = 'Invite resent successfully via email';
+      } else if (invite.phone) {
+        if (smsSent) {
+          successMessage = 'Invite resent successfully via SMS';
+        } else {
+          // For phone-only invites, we should fail if SMS doesn't work
+          return reply.code(500).send({
+            success: false,
+            message: smsErrorMessage 
+              ? `Failed to send SMS: ${smsErrorMessage}`
+              : 'Failed to send SMS. Please try again.',
+            error: smsErrorMessage || 'SMS sending failed'
+          });
+        }
+      }
+
+      return reply.send({
+        success: true,
+        message: successMessage,
+      });
+    } catch (error) {
+      request.log.error({
+        err: error,
+        stack: error.stack,
+        message: error.message,
+      }, 'Failed to resend invite');
+
+      return reply.code(500).send({
+        message: 'Failed to resend invite',
+        error: error.message,
+      });
+    }
+  });
+
+  // Delete/cancel a business invite
+  app.delete('/businesses/:businessId/invites/:inviteId', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      const { businessId, inviteId } = request.params;
+
+      // Check if business exists
+      const businessResult = await app.pg.query(
+        'SELECT id, name, owner_user_id FROM public.businesses WHERE id = $1',
+        [businessId]
+      );
+
+      if (businessResult.rows.length === 0) {
+        return reply.code(404).send({ message: 'Business not found' });
+      }
+
+      const business = businessResult.rows[0];
+
+      // Only business owner or partner (book owner in this business) can delete invites
+      if (business.owner_user_id !== user.id) {
+        const partnerCheck = await app.pg.query(
+          'SELECT id FROM public.books WHERE business_id = $1 AND owner_user_id = $2 LIMIT 1',
+          [businessId, user.id]
+        );
+
+        if (partnerCheck.rows.length === 0) {
+          return reply.code(403).send({ message: 'Access denied. You can only manage invites for your own business or businesses where you are a partner.' });
+        }
+      }
+
+      // Ensure business_invites table exists
+      const invitesTableCheck = await app.pg.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = 'business_invites'
+        );
+      `);
+
+      if (!invitesTableCheck.rows[0]?.exists) {
+        return reply.code(404).send({ message: 'Invite system not configured' });
+      }
+
+      // Mark invite as rejected (treated as cancelled) - do not hard-delete
+      const updateResult = await app.pg.query(
+        `UPDATE public.business_invites
+         SET status = 'rejected', updated_at = now()
+         WHERE id = $1 AND business_id = $2
+         RETURNING id, business_id, status`,
+        [inviteId, businessId]
+      );
+
+      if (updateResult.rows.length === 0) {
+        return reply.code(404).send({ message: 'Invite not found' });
+      }
+
+      // Also mark any related user_invites records as cancelled (best effort)
+      try {
+        const userInvitesTableCheck = await app.pg.query(`
+          SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = 'user_invites'
+          );
+        `);
+
+        if (userInvitesTableCheck.rows[0]?.exists) {
+          await app.pg.query(
+            `UPDATE public.user_invites
+             SET status = 'inactive', updated_at = now()
+             WHERE business_invite_id = $1`,
+            [inviteId]
+          );
+        }
+      } catch (userInviteError) {
+        request.log.warn({ err: userInviteError, inviteId }, 'Failed to update user_invites status when cancelling invite');
+      }
+
+      return reply.send({
+        success: true,
+        message: 'Invite cancelled successfully',
+        invite: updateResult.rows[0],
+      });
+    } catch (error) {
+      request.log.error({
+        err: error,
+        stack: error.stack,
+        message: error.message,
+      }, 'Failed to cancel invite');
+
+      // Surface the underlying error message to the client to help debugging
+      return reply.code(500).send({
+        message: error.message || 'Failed to cancel invite',
         error: error.message,
       });
     }
@@ -679,11 +1009,54 @@ async function businessesRoutes(app) {
       }
 
       const { id } = request.params;
-      const { email, phone, role, cashbookId } = request.body;
+      let { email, phone, role, cashbookId } = request.body;
 
       // Validate that either email or phone is provided
       if (!email && !phone) {
         return reply.code(400).send({ message: 'Either email or phone is required' });
+      }
+
+      // Validate role-specific requirements
+      if (role === 'Staff' && !cashbookId) {
+        return reply.code(400).send({ message: 'Cashbook ID is required when inviting Staff members' });
+      }
+      if (role === 'Partner' && !id) {
+        return reply.code(400).send({ message: 'Business ID is required when inviting Partners' });
+      }
+
+      // Normalize: if only phone is provided, ensure email is null/undefined (not empty string or phone value)
+      // If only email is provided, ensure phone is null/undefined
+      if (phone && !email) {
+        email = null; // Explicitly set to null when only phone is provided
+      }
+      if (email && !phone) {
+        phone = null; // Explicitly set to null when only email is provided
+      }
+
+      // Validate email format if email is provided
+      if (email) {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          return reply.code(400).send({ message: 'Invalid email format' });
+        }
+      }
+
+      // For Staff invites, verify cashbook exists and belongs to the business
+      if (role === 'Staff' && cashbookId) {
+        const cashbookCheck = await app.pg.query(
+          'SELECT id, business_id FROM public.books WHERE id = $1',
+          [cashbookId]
+        );
+        
+        if (cashbookCheck.rows.length === 0) {
+          return reply.code(404).send({ message: 'Cashbook not found' });
+        }
+        
+        const cashbook = cashbookCheck.rows[0];
+        // Verify cashbook belongs to the business (or allow if cashbook has no business_id for flexibility)
+        if (cashbook.business_id && cashbook.business_id !== id) {
+          return reply.code(400).send({ message: 'Cashbook does not belong to this business' });
+        }
       }
 
       // Check if business exists
@@ -724,10 +1097,11 @@ async function businessesRoutes(app) {
       const inviterName = [inviter?.first_name, inviter?.last_name].filter(Boolean).join(' ').trim() || inviter?.email?.split('@')[0] || 'Someone';
 
       // Generate invite token (simple hash for now)
+      // Use normalized email/phone values (null when not provided)
       const inviteData = {
         businessId: id,
-        email: email || null,
-        phone: phone || null,
+        email: email ? email.trim() : null, // Explicitly null if not provided
+        phone: phone ? phone.trim() : null, // Explicitly null if not provided
         role: role,
         invitedBy: user.id,
         expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
@@ -748,8 +1122,47 @@ async function businessesRoutes(app) {
         );
       `);
 
+      // Generate invite link first (needed for short URL creation)
+      const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+      // For invite link, use email if available, otherwise use phone (but don't mix them)
+      // Use normalized values from inviteData to ensure we don't use phone as email
+      const inviteIdentifier = inviteData.email || inviteData.phone || '';
+      const identifierParam = inviteData.email ? 'email' : 'phone';
+      let inviteLink = `${baseUrl}/invite?token=${inviteToken}&business=${id}&${identifierParam}=${encodeURIComponent(inviteIdentifier)}&role=${role}`;
+      // Add cashbookId to invite link if provided (for Staff invites from specific books)
+      if (cashbookId) {
+        inviteLink += `&cashbook=${cashbookId}`;
+      }
+
+      // Create short URL for SMS (if phone invite)
+      let shortUrlForSms = null;
+      if (inviteData.phone) {
+        try {
+          // Set expiration to match invite expiration (7 days)
+          const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+          request.log.info({ inviteLink, expiresAt }, 'Attempting to create short URL');
+          const shortUrlData = await createShortUrl(app.pg, inviteLink, expiresAt);
+          shortUrlForSms = shortUrlData.shortUrl;
+          request.log.info({ 
+            shortCode: shortUrlData.shortCode, 
+            originalUrl: inviteLink,
+            shortUrl: shortUrlForSms,
+            shortUrlId: shortUrlData.id
+          }, 'Successfully created short URL for SMS invite');
+        } catch (shortUrlError) {
+          request.log.error({ 
+            err: shortUrlError,
+            message: shortUrlError.message,
+            stack: shortUrlError.stack,
+            inviteLink
+          }, 'Failed to create short URL, will use long URL');
+          // Continue with long URL if short URL creation fails
+        }
+      }
+
       if (invitesTableCheck.rows[0]?.exists) {
         // Check if an invite already exists for this business, email, and phone combination
+        // Use normalized values to ensure proper matching
         const existingInvite = await app.pg.query(
           `SELECT id FROM public.business_invites 
            WHERE business_id = $1 
@@ -757,40 +1170,33 @@ async function businessesRoutes(app) {
            AND (phone = $3 OR ($3 IS NULL AND phone IS NULL))
            AND role = $4
            LIMIT 1`,
-          [id, email || null, phone || null, role]
+          [id, inviteData.email, inviteData.phone, role]
         );
 
         if (existingInvite.rows.length > 0) {
-          // Update existing invite
+          // Update existing invite (include cashbook_id and short_url if provided)
           await app.pg.query(
             `UPDATE public.business_invites 
-             SET invite_token = $1, expires_at = $2, status = 'pending', updated_at = now()
+             SET invite_token = $1, expires_at = $2, status = 'pending', updated_at = now(), cashbook_id = $4, email = $5, phone = $6, short_url = COALESCE($7, short_url)
              WHERE id = $3`,
-            [inviteToken, inviteData.expiresAt, existingInvite.rows[0].id]
+            [inviteToken, inviteData.expiresAt, existingInvite.rows[0].id, cashbookId || null, inviteData.email, inviteData.phone, shortUrlForSms]
           );
         } else {
-          // Insert new invite record
+          // Insert new invite record (include cashbook_id and short_url if provided)
+          // Use normalized values from inviteData to ensure email/phone are properly null when not provided
           await app.pg.query(
-            `INSERT INTO public.business_invites (business_id, email, phone, role, invite_token, invited_by, expires_at, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
-            [id, email || null, phone || null, role, inviteToken, user.id, inviteData.expiresAt]
+            `INSERT INTO public.business_invites (business_id, email, phone, role, invite_token, invited_by, expires_at, status, cashbook_id, short_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)`,
+            [id, inviteData.email, inviteData.phone, role, inviteToken, user.id, inviteData.expiresAt, cashbookId || null, shortUrlForSms]
           );
         }
       }
 
-      // Generate invite link
-      const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
-      let inviteLink = `${baseUrl}/invite?token=${inviteToken}&business=${id}&email=${encodeURIComponent(email || phone || '')}&role=${role}`;
-      // Add cashbookId to invite link if provided (for Staff invites from specific books)
-      if (cashbookId) {
-        inviteLink += `&cashbook=${cashbookId}`;
-      }
-
-      // Send invite email if email is provided
-      if (email) {
+      // Send invite email ONLY if a valid email is provided (not phone)
+      if (inviteData.email) {
         try {
           await sendInviteEmail({
-            email,
+            email: inviteData.email, // Use normalized email value
             businessName: business.name,
             inviteLink,
             role,
@@ -805,17 +1211,50 @@ async function businessesRoutes(app) {
         }
       }
 
-      // For phone invites, you might want to send SMS instead
-      // For now, we'll just store the invite
+      // Send invite SMS ONLY if a valid phone is provided (not email)
+      if (inviteData.phone) {
+        try {
+          // Use short URL for SMS if available, otherwise use long URL
+          const smsLink = shortUrlForSms || inviteLink;
+          await sendInviteSms({
+            phone: inviteData.phone, // Use normalized phone value
+            businessName: business.name,
+            inviteLink: smsLink,
+            role,
+            inviterName,
+          });
+          request.log.info({ 
+            phone, 
+            businessName: business.name,
+            usedShortUrl: !!shortUrlForSms,
+            link: smsLink
+          }, 'Invite SMS sent successfully');
+        } catch (smsError) {
+          request.log.error({ err: smsError, phone }, 'Failed to send invite SMS');
+          // Don't fail the entire request if SMS fails - the invite is still created
+          // Just log the error and continue
+        }
+      }
+
+      // Determine success message based on what was sent
+      // Use normalized values from inviteData
+      let successMessage = 'Invite created successfully';
+      if (inviteData.email && inviteData.phone) {
+        successMessage = 'Invite sent successfully via email and SMS';
+      } else if (inviteData.email) {
+        successMessage = 'Invite sent successfully via email';
+      } else if (inviteData.phone) {
+        successMessage = 'Invite sent successfully via SMS';
+      }
 
       return reply.code(201).send({
         success: true,
-        message: email ? 'Invite sent successfully via email' : 'Invite created successfully',
+        message: successMessage,
         invite: {
           token: inviteToken,
           inviteLink,
-          email: email || null,
-          phone: phone || null,
+          email: inviteData.email, // Use normalized values
+          phone: inviteData.phone, // Use normalized values
           role,
           businessId: id,
           businessName: business.name,

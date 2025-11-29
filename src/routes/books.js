@@ -522,9 +522,24 @@ async function booksRoutes(app) {
       // Check if user is admin or owner
       const roles = await getUserRoles(app.pg, user.id);
       const isAdmin = roles.includes('admin');
+      const isOwner = book.owner_user_id === user.id;
 
-      if (!isAdmin && book.owner_user_id !== user.id) {
-        return reply.code(403).send({ message: 'Access denied. Only the book owner can add parties.' });
+      // If not admin and not owner, check if user is a member of the book and has cashin/cashout permissions
+      if (!isAdmin && !isOwner) {
+        // Check if user is a member of this book (via book_users table)
+        const bookMemberCheck = await app.pg.query(
+          'SELECT id FROM public.book_users WHERE book_id = $1 AND user_id = $2',
+          [bookId, user.id]
+        );
+
+        if (bookMemberCheck.rows.length === 0) {
+          return reply.code(403).send({ message: 'Access denied. You must be a member of this book to add parties.' });
+        }
+
+        // User is a member, check if they have cashin or cashout permissions
+        if (!canCashIn && !canCashOut) {
+          return reply.code(403).send({ message: 'Access denied. You need Cash In or Cash Out permissions to add parties.' });
+        }
       }
 
       // Insert new party
