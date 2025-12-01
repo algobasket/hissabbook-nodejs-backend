@@ -165,6 +165,37 @@ async function authRoutes(app) {
       const roles = await getUserRoles(app.pg, user.id);
       const primaryRole = roles[0] || 'managers';
 
+      // Fetch wallet balance for this user (if wallets table exists)
+      let walletBalance = null;
+      let walletCurrency = 'INR';
+      try {
+        const walletTableCheck = await app.pg.query(`
+          SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = 'user_wallets'
+          );
+        `);
+
+        if (walletTableCheck.rows[0]?.exists) {
+          const walletResult = await app.pg.query(
+            'SELECT balance, currency_code FROM public.user_wallets WHERE user_id = $1 LIMIT 1',
+            [user.id]
+          );
+
+          if (walletResult.rows.length > 0) {
+            const row = walletResult.rows[0];
+            walletBalance = parseFloat(row.balance || '0');
+            walletCurrency = row.currency_code || 'INR';
+          }
+        }
+      } catch (walletError) {
+        request.log.error(
+          { err: walletError, userId: user.id },
+          'Failed to fetch wallet balance for account-details'
+        );
+      }
+
       if (!userDetails) {
         return reply.send({
           email: user.email,
@@ -178,6 +209,8 @@ async function authRoutes(app) {
           role: primaryRole,
           roles: roles,
           isEmailVerified: user.is_email_verified || false,
+          walletBalance,
+          walletCurrency,
         });
       }
 
@@ -209,6 +242,8 @@ async function authRoutes(app) {
         role: primaryRole,
         roles: roles,
         isEmailVerified: user.is_email_verified || false,
+        walletBalance,
+        walletCurrency,
       });
     } catch (error) {
       request.log.error({ err: error, stack: error.stack }, 'Failed to fetch account details');
