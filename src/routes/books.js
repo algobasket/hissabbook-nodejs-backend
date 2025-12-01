@@ -1132,7 +1132,7 @@ async function booksRoutes(app) {
 
       // Verify book exists and user has access
       const bookResult = await app.pg.query(
-        `SELECT b.id, b.owner_user_id
+        `SELECT b.id, b.owner_user_id, COALESCE(b.staff_cashin_cashout_enabled, false) as staff_cashin_cashout_enabled
          FROM public.books b
          WHERE b.id = $1`,
         [bookId]
@@ -1147,6 +1147,7 @@ async function booksRoutes(app) {
       // Check if user is admin or has access to this book
       const roles = await getUserRoles(app.pg, user.id);
       const isAdmin = roles.includes('admin');
+      const isStaff = roles.includes('staff') || roles.includes('agents');
 
       if (!isAdmin && book.owner_user_id !== user.id) {
         // Check if user is a member of this book
@@ -1157,6 +1158,13 @@ async function booksRoutes(app) {
 
         if (memberCheck.rows.length === 0) {
           return reply.code(403).send({ message: 'Access denied. You do not have access to this book.' });
+        }
+
+        // If user is staff (not manager/admin), check if Cash In/Cash Out is enabled for staff
+        if (isStaff && !book.staff_cashin_cashout_enabled) {
+          return reply.code(403).send({ 
+            message: 'Access denied. Cash In/Cash Out is disabled for staff members in this cashbook. Please contact the manager to enable it.' 
+          });
         }
       }
 
@@ -1744,6 +1752,7 @@ async function booksRoutes(app) {
           b.updated_at,
           b.owner_user_id,
           b.business_id,
+          COALESCE(b.staff_cashin_cashout_enabled, false) as staff_cashin_cashout_enabled,
           u.email as owner_email,
           ud.first_name as owner_first_name,
           ud.last_name as owner_last_name,
@@ -1806,6 +1815,7 @@ async function booksRoutes(app) {
         currencyCode: row.currency_code || 'INR',
         ownerId: row.owner_user_id,
         businessId: row.business_id || null,
+        staffCashinCashoutEnabled: row.staff_cashin_cashout_enabled || false,
         ownerEmail: row.owner_email,
         ownerName: ownerFullName,
         ownerFirstName: row.owner_first_name || null,
@@ -1866,7 +1876,7 @@ async function booksRoutes(app) {
       }
 
       const { id } = request.params;
-      const { name, description, currencyCode, businessId } = request.body;
+      const { name, description, currencyCode, businessId, staffCashinCashoutEnabled } = request.body;
 
       // Check if book exists and user owns it
       const bookCheck = await app.pg.query(
@@ -1919,6 +1929,10 @@ async function booksRoutes(app) {
         updates.push(`business_id = $${paramIndex++}`);
         params.push(businessId || null);
       }
+      if (staffCashinCashoutEnabled !== undefined) {
+        updates.push(`staff_cashin_cashout_enabled = $${paramIndex++}`);
+        params.push(staffCashinCashoutEnabled === true || staffCashinCashoutEnabled === 'true');
+      }
 
       if (updates.length === 0) {
         return reply.code(400).send({ message: 'No fields to update' });
@@ -1931,7 +1945,7 @@ async function booksRoutes(app) {
         UPDATE public.books
         SET ${updates.join(', ')}
         WHERE id = $${paramIndex}
-        RETURNING id, name, description, currency_code, owner_user_id, business_id, created_at, updated_at
+        RETURNING id, name, description, currency_code, owner_user_id, business_id, staff_cashin_cashout_enabled, created_at, updated_at
       `;
 
       const result = await app.pg.query(query, params);
@@ -1946,6 +1960,7 @@ async function booksRoutes(app) {
           currencyCode: updatedBook.currency_code,
           ownerId: updatedBook.owner_user_id,
           businessId: updatedBook.business_id,
+          staffCashinCashoutEnabled: updatedBook.staff_cashin_cashout_enabled || false,
           createdAt: updatedBook.created_at,
           updatedAt: updatedBook.updated_at,
         },
