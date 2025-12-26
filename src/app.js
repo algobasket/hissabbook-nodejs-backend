@@ -112,6 +112,7 @@ async function buildApp() {
         '.gif': 'image/gif',
         '.webp': 'image/webp',
         '.pdf': 'application/pdf',
+        '.apk': 'application/vnd.android.package-archive',
       };
       const contentType = contentTypeMap[ext] || 'application/octet-stream';
 

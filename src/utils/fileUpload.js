@@ -6,9 +6,10 @@ const crypto = require('crypto');
  * Save a file to disk from base64 string
  * @param {string} base64String - Base64 encoded file string (data:image/...;base64,... or data:application/pdf;base64,...)
  * @param {string} prefix - Prefix for the filename (e.g., "bill", "attachment")
+ * @param {string} customFileName - Optional custom filename (without extension). If provided, this will be used instead of auto-generated name.
  * @returns {Promise<{fileName: string, filePath: string, mimeType: string, fileSize: number}>} - File info
  */
-async function saveFileToDisk(base64String, prefix = "file") {
+async function saveFileToDisk(base64String, prefix = "file", customFileName = null) {
   if (!base64String) {
     return null;
   }
@@ -19,21 +20,28 @@ async function saveFileToDisk(base64String, prefix = "file") {
     throw new Error("Invalid file format. Expected data URL.");
   }
 
-  const mimeType = matches[1];
+  let mimeType = matches[1];
   const data = matches[2];
 
-  // Validate file type (images or PDFs)
+  // Validate file type (images, PDFs, or APK files)
   const allowedMimeTypes = [
     'image/jpeg',
     'image/jpg',
     'image/png',
     'image/gif',
     'image/webp',
-    'application/pdf'
+    'application/pdf',
+    'application/vnd.android.package-archive',
+    'application/octet-stream' // Some APKs might have this MIME type
   ];
 
+  // If prefix is 'apk' and MIME type is application/octet-stream, treat it as APK
+  if (prefix === 'apk' && mimeType === 'application/octet-stream') {
+    mimeType = 'application/vnd.android.package-archive';
+  }
+
   if (!allowedMimeTypes.includes(mimeType)) {
-    throw new Error("Invalid file type. Only images (JPEG, PNG, GIF, WebP) and PDFs are allowed.");
+    throw new Error("Invalid file type. Only images (JPEG, PNG, GIF, WebP), PDFs, and APK files are allowed.");
   }
 
   const buffer = Buffer.from(data, "base64");
@@ -46,15 +54,25 @@ async function saveFileToDisk(base64String, prefix = "file") {
     'image/png': 'png',
     'image/gif': 'gif',
     'image/webp': 'webp',
-    'application/pdf': 'pdf'
+    'application/pdf': 'pdf',
+    'application/vnd.android.package-archive': 'apk',
+    'application/octet-stream': prefix === 'apk' ? 'apk' : 'bin' // Only treat as APK if prefix indicates it
   };
   const extension = mimeToExt[mimeType] || 'bin';
 
-  // Generate unique filename
-  const uniqueId = typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID()
-    : crypto.randomBytes(16).toString('hex');
-  const fileName = `${prefix}-${Date.now()}-${uniqueId}.${extension}`;
+  // Generate filename - use custom filename if provided, otherwise generate unique name
+  let fileName;
+  if (customFileName) {
+    // Sanitize custom filename to prevent directory traversal and ensure valid filename
+    const sanitized = customFileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    fileName = `${sanitized}.${extension}`;
+  } else {
+    // Generate unique filename
+    const uniqueId = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString('hex');
+    fileName = `${prefix}-${Date.now()}-${uniqueId}.${extension}`;
+  }
 
   // Create uploads directory if it doesn't exist
   const uploadDir = path.join(process.cwd(), 'uploads');

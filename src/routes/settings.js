@@ -1,7 +1,7 @@
 // Settings Routes for system-wide settings
 
 const { findUserByEmail, getUserRoles } = require('../services/userService');
-const { saveFileToDisk } = require('../utils/fileUpload');
+const { saveFileToDisk, deleteFileFromDisk } = require('../utils/fileUpload');
 
 async function settingsRoutes(app) {
   // Get payment currency setting
@@ -241,7 +241,12 @@ async function settingsRoutes(app) {
             site_address,
             site_logo_filename,
             small_logo_filename,
-            big_logo_filename
+            big_logo_filename,
+            google_play_url,
+            app_store_url,
+            apk_download_url,
+            apk_version,
+            apk_file_size
            FROM public.site_settings
            LIMIT 1`
         );
@@ -274,6 +279,11 @@ async function settingsRoutes(app) {
           siteLogoUrl: null,
           smallLogoUrl: null,
           bigLogoUrl: null,
+          googlePlayUrl: null,
+          appStoreUrl: null,
+          apkDownloadUrl: null,
+          apkVersion: null,
+          apkFileSize: null,
         });
       }
 
@@ -288,6 +298,11 @@ async function settingsRoutes(app) {
         siteLogoUrl: settings.site_logo_filename || null,
         smallLogoUrl: settings.small_logo_filename || null,
         bigLogoUrl: settings.big_logo_filename || null,
+        googlePlayUrl: settings.google_play_url || null,
+        appStoreUrl: settings.app_store_url || null,
+        apkDownloadUrl: settings.apk_download_url || null,
+        apkVersion: settings.apk_version || null,
+        apkFileSize: settings.apk_file_size || null,
       });
     } catch (error) {
       request.log.error({ err: error }, 'Failed to fetch site settings');
@@ -313,6 +328,12 @@ async function settingsRoutes(app) {
           siteLogo: { type: 'string' }, // base64 data URL
           smallLogo: { type: 'string' }, // base64 data URL
           bigLogo: { type: 'string' }, // base64 data URL
+          googlePlayUrl: { type: 'string' },
+          appStoreUrl: { type: 'string' },
+          apkDownloadUrl: { type: 'string' },
+          apkFile: { type: 'string' }, // base64 data URL for APK upload
+          apkVersion: { type: 'string' },
+          apkFileSize: { type: 'string' },
         },
       },
     },
@@ -331,7 +352,7 @@ async function settingsRoutes(app) {
         return reply.code(403).send({ message: 'Access denied. Admin role required.' });
       }
 
-      const { siteName, siteDescription, siteEmail, sitePhone, siteAddress, siteLogo, smallLogo, bigLogo } = request.body;
+      const { siteName, siteDescription, siteEmail, sitePhone, siteAddress, siteLogo, smallLogo, bigLogo, googlePlayUrl, appStoreUrl, apkDownloadUrl, apkFile, apkVersion, apkFileSize } = request.body;
 
       // Handle logo uploads
       let siteLogoFilename = null;
@@ -374,16 +395,79 @@ async function settingsRoutes(app) {
         }
       }
 
-      // Check if site_settings record exists
+      // Check if site_settings record exists (needed to check for old APK file)
       const existing = await app.pg.query(
-        `SELECT id FROM public.site_settings LIMIT 1`
+        `SELECT id, apk_download_url FROM public.site_settings LIMIT 1`
       );
+
+      // Handle APK file upload
+      let finalApkDownloadUrl = apkDownloadUrl;
+      let finalApkFileSize = apkFileSize;
+
+      if (apkFile) {
+        try {
+          const version = apkVersion || '1.0';
+          const customFileName = `hissabbook-v${version.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+          const fileInfo = await saveFileToDisk(apkFile, 'apk', customFileName);
+          if (fileInfo) {
+            // Calculate file size if not provided
+            if (!finalApkFileSize) {
+              const sizeInMB = (fileInfo.fileSize / (1024 * 1024)).toFixed(2);
+              finalApkFileSize = `${sizeInMB} MB`;
+            }
+
+            // Check if this version already exists
+            const existingVersion = await app.pg.query(
+              `SELECT id FROM public.apk_versions WHERE version = $1`,
+              [version]
+            );
+
+            if (existingVersion.rows.length > 0) {
+              // Update existing version and mark as current
+              // First unset all current versions
+              await app.pg.query(
+                `UPDATE public.apk_versions SET is_current = false WHERE is_current = true`
+              );
+              // Then update this version and mark as current
+              await app.pg.query(
+                `UPDATE public.apk_versions 
+                 SET filename = $1, file_size = $2, download_url = $3, is_current = true, updated_at = now()
+                 WHERE version = $4`,
+                [fileInfo.fileName, finalApkFileSize, fileInfo.fileName, version]
+              );
+            } else {
+              // Set all existing versions to not current
+              await app.pg.query(
+                `UPDATE public.apk_versions SET is_current = false WHERE is_current = true`
+              );
+
+              // Insert new version and mark as current
+              await app.pg.query(
+                `INSERT INTO public.apk_versions (version, filename, file_size, download_url, is_current)
+                 VALUES ($1, $2, $3, $4, true)`,
+                [version, fileInfo.fileName, finalApkFileSize, fileInfo.fileName]
+              );
+            }
+
+            // Also update site_settings with current version (for backward compatibility)
+            finalApkDownloadUrl = fileInfo.fileName;
+          }
+        } catch (apkError) {
+          request.log.error({ err: apkError }, 'Failed to save APK file');
+          return reply.code(400).send({ 
+            message: 'Failed to save APK file', 
+            error: apkError.message 
+          });
+        }
+      }
 
       if (existing.rows.length > 0) {
         // Update existing record
         const updateFields = [];
         const updateValues = [];
         let paramIndex = 1;
+        const existingId = existing.rows[0].id;
 
         if (siteName !== undefined) {
           updateFields.push(`site_name = $${paramIndex++}`);
@@ -417,10 +501,35 @@ async function settingsRoutes(app) {
           updateFields.push(`big_logo_filename = $${paramIndex++}`);
           updateValues.push(bigLogoFilename);
         }
+        if (googlePlayUrl !== undefined) {
+          updateFields.push(`google_play_url = $${paramIndex++}`);
+          updateValues.push(googlePlayUrl || null);
+        }
+        if (appStoreUrl !== undefined) {
+          updateFields.push(`app_store_url = $${paramIndex++}`);
+          updateValues.push(appStoreUrl || null);
+        }
+        if (apkDownloadUrl !== undefined || apkFile) {
+          updateFields.push(`apk_download_url = $${paramIndex++}`);
+          updateValues.push(finalApkDownloadUrl || null);
+        }
+        if (apkFile && !apkFileSize && finalApkFileSize) {
+          // Update file size if APK was uploaded and size wasn't explicitly provided
+          updateFields.push(`apk_file_size = $${paramIndex++}`);
+          updateValues.push(finalApkFileSize);
+        }
+        if (apkVersion !== undefined) {
+          updateFields.push(`apk_version = $${paramIndex++}`);
+          updateValues.push(apkVersion || null);
+        }
+        if (apkFileSize !== undefined) {
+          updateFields.push(`apk_file_size = $${paramIndex++}`);
+          updateValues.push(apkFileSize || null);
+        }
 
         if (updateFields.length > 0) {
           updateFields.push(`updated_at = now()`);
-          updateValues.push(existing.rows[0].id);
+          updateValues.push(existingId);
 
           await app.pg.query(
             `UPDATE public.site_settings 
@@ -434,7 +543,7 @@ async function settingsRoutes(app) {
             `UPDATE public.site_settings 
              SET updated_at = now()
              WHERE id = $1`,
-            [existing.rows[0].id]
+            [existingId]
           );
         }
       } else {
@@ -467,6 +576,11 @@ async function settingsRoutes(app) {
           site_phone,
           site_address,
           site_logo_filename,
+          google_play_url,
+          app_store_url,
+          apk_download_url,
+          apk_version,
+          apk_file_size,
           small_logo_filename,
           big_logo_filename
          FROM public.site_settings
@@ -486,11 +600,82 @@ async function settingsRoutes(app) {
         siteLogoUrl: updatedSettings.site_logo_filename || null,
         smallLogoUrl: updatedSettings.small_logo_filename || null,
         bigLogoUrl: updatedSettings.big_logo_filename || null,
+        googlePlayUrl: updatedSettings.google_play_url || null,
+        appStoreUrl: updatedSettings.app_store_url || null,
+        apkDownloadUrl: updatedSettings.apk_download_url || null,
+        apkVersion: updatedSettings.apk_version || null,
+        apkFileSize: updatedSettings.apk_file_size || null,
       });
     } catch (error) {
       request.log.error({ err: error }, 'Failed to update site settings');
       return reply.code(500).send({ 
         message: 'Failed to update site settings', 
+        error: error.message 
+      });
+    }
+  });
+
+  // Get all APK versions
+  app.get('/settings/apk-versions', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Check if user is admin
+      const roles = await getUserRoles(app.pg, user.id);
+      const isAdmin = roles.includes('admin');
+
+      if (!isAdmin) {
+        return reply.code(403).send({ message: 'Access denied. Admin role required.' });
+      }
+
+      // Get all APK versions, ordered by creation date (newest first)
+      const result = await app.pg.query(
+        `SELECT 
+          id,
+          version,
+          filename,
+          file_size,
+          download_url,
+          is_current,
+          created_at,
+          updated_at
+         FROM public.apk_versions
+         ORDER BY created_at DESC`
+      );
+
+      // Build download URLs for each version
+      // Use request protocol and host to build absolute URLs
+      const protocol = request.headers['x-forwarded-proto'] || request.protocol || 'https';
+      const host = request.headers.host || 'hissabbook.com';
+      const baseUrl = `${protocol}://${host}`;
+      
+      const versions = result.rows.map(row => ({
+        id: row.id,
+        version: row.version,
+        filename: row.filename,
+        fileSize: row.file_size,
+        downloadUrl: row.download_url && !row.download_url.startsWith('http') 
+          ? `${baseUrl}/backend/uploads/${row.download_url}` 
+          : row.download_url,
+        isCurrent: row.is_current,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      }));
+
+      return reply.send({ versions });
+    } catch (error) {
+      // If table doesn't exist yet, return empty array
+      if (error.code === '42P01') {
+        return reply.send({ versions: [] });
+      }
+      request.log.error({ err: error }, 'Failed to fetch APK versions');
+      return reply.code(500).send({ 
+        message: 'Failed to fetch APK versions', 
         error: error.message 
       });
     }
