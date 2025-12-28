@@ -173,7 +173,10 @@ async function settingsRoutes(app) {
         result = await app.pg.query(
           `SELECT 
             small_logo_filename,
-            big_logo_filename
+            big_logo_filename,
+            google_play_url,
+            app_store_url,
+            apk_download_url
            FROM public.site_settings
            LIMIT 1`
         );
@@ -183,6 +186,9 @@ async function settingsRoutes(app) {
           return reply.send({
             smallLogoUrl: null,
             bigLogoUrl: null,
+            googlePlayUrl: null,
+            appStoreUrl: null,
+            apkDownloadUrl: null,
           });
         }
         throw tableError;
@@ -192,20 +198,37 @@ async function settingsRoutes(app) {
         return reply.send({
           smallLogoUrl: null,
           bigLogoUrl: null,
+          googlePlayUrl: null,
+          appStoreUrl: null,
+          apkDownloadUrl: null,
         });
       }
 
       const settings = result.rows[0];
+      
+      // Build APK download URL if filename exists
+      let apkDownloadUrl = settings.apk_download_url || null;
+      if (apkDownloadUrl && !apkDownloadUrl.startsWith('http')) {
+        // If it's a filename (not a full URL), return just the filename
+        // Frontend will construct the full URL using API_BASE
+        // This way it works correctly in both development and production
+      }
 
       return reply.send({
         smallLogoUrl: settings.small_logo_filename || null,
         bigLogoUrl: settings.big_logo_filename || null,
+        googlePlayUrl: settings.google_play_url || null,
+        appStoreUrl: settings.app_store_url || null,
+        apkDownloadUrl: apkDownloadUrl,
       });
     } catch (error) {
       request.log.error({ err: error }, 'Failed to fetch site settings (public)');
       return reply.send({ 
         smallLogoUrl: null,
         bigLogoUrl: null,
+        googlePlayUrl: null,
+        appStoreUrl: null,
+        apkDownloadUrl: null,
       });
     }
   });
@@ -454,10 +477,11 @@ async function settingsRoutes(app) {
             finalApkDownloadUrl = fileInfo.fileName;
           }
         } catch (apkError) {
-          request.log.error({ err: apkError }, 'Failed to save APK file');
+          request.log.error({ err: apkError, stack: apkError.stack }, 'Failed to save APK file');
           return reply.code(400).send({ 
             message: 'Failed to save APK file', 
-            error: apkError.message 
+            error: apkError.message || String(apkError),
+            details: process.env.NODE_ENV === 'development' ? apkError.stack : undefined
           });
         }
       }
