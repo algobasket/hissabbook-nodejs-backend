@@ -704,6 +704,253 @@ async function settingsRoutes(app) {
       });
     }
   });
+
+  // Get maintenance settings
+  app.get('/settings/maintenance', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Check if user is admin
+      const roles = await getUserRoles(app.pg, user.id);
+      const isAdmin = roles.includes('admin');
+
+      if (!isAdmin) {
+        return reply.code(403).send({ message: 'Access denied. Admin role required.' });
+      }
+
+      // Get maintenance settings from settings table
+      const result = await app.pg.query(
+        `SELECT key, value 
+         FROM public.settings 
+         WHERE key IN ('maintenance_title', 'maintenance_message', 'maintenance_block_staff', 'maintenance_block_manager')
+         AND is_system = true 
+         AND owner_user_id IS NULL`
+      );
+
+      const settings = {
+        title: '',
+        message: '',
+        blockStaff: false,
+        blockManager: false,
+      };
+
+      result.rows.forEach((row) => {
+        // PostgreSQL jsonb returns values in their native type
+        let value = row.value;
+        
+        // Log the raw value for debugging
+        request.log.info({ key: row.key, rawValue: value, valueType: typeof value }, 'Reading maintenance setting');
+        
+        // If value is null or undefined, use default
+        if (value === null || value === undefined) {
+          if (row.key.includes('block')) {
+            value = false;
+          } else {
+            value = '';
+          }
+        }
+        
+        // PostgreSQL jsonb returns the actual value type
+        // If it's stored as a boolean, it will be a boolean
+        // If it's stored as a string, it will be a string
+        // We need to handle both cases
+        if (typeof value === 'string') {
+          // If it's the string "true" or "false", convert to boolean
+          if (value === 'true') {
+            value = true;
+          } else if (value === 'false') {
+            value = false;
+          } else if (value.startsWith('{') || value.startsWith('[') || (value.startsWith('"') && value.length > 1)) {
+            // Try to parse if it looks like JSON
+            try {
+              const parsed = JSON.parse(value);
+              value = parsed;
+            } catch {
+              // If parsing fails, use the string as-is
+            }
+          }
+        }
+        
+        // Extract value from object if needed (shouldn't happen with our current storage, but handle it)
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+          value = value.value !== undefined ? value.value : value;
+        }
+        
+        if (row.key === 'maintenance_title') {
+          settings.title = typeof value === 'string' ? value : String(value || '');
+        } else if (row.key === 'maintenance_message') {
+          settings.message = typeof value === 'string' ? value : String(value || '');
+        } else if (row.key === 'maintenance_block_staff') {
+          // Convert to boolean - handle various formats
+          if (typeof value === 'boolean') {
+            settings.blockStaff = value;
+          } else if (typeof value === 'string') {
+            settings.blockStaff = value.toLowerCase() === 'true' || value === '1';
+          } else if (typeof value === 'number') {
+            settings.blockStaff = value === 1;
+          } else {
+            settings.blockStaff = Boolean(value);
+          }
+          request.log.info({ key: row.key, finalValue: settings.blockStaff }, 'Parsed blockStaff');
+        } else if (row.key === 'maintenance_block_manager') {
+          // Convert to boolean - handle various formats
+          if (typeof value === 'boolean') {
+            settings.blockManager = value;
+          } else if (typeof value === 'string') {
+            settings.blockManager = value.toLowerCase() === 'true' || value === '1';
+          } else if (typeof value === 'number') {
+            settings.blockManager = value === 1;
+          } else {
+            settings.blockManager = Boolean(value);
+          }
+          request.log.info({ key: row.key, finalValue: settings.blockManager }, 'Parsed blockManager');
+        }
+      });
+      
+      request.log.info({ finalSettings: settings }, 'Final maintenance settings');
+
+      return reply.send(settings);
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to fetch maintenance settings');
+      return reply.code(500).send({ 
+        message: 'Failed to fetch maintenance settings', 
+        error: error.message 
+      });
+    }
+  });
+
+  // Update maintenance settings
+  app.put('/settings/maintenance', {
+    preValidation: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: [],
+        properties: {
+          title: { type: 'string' },
+          message: { type: 'string' },
+          blockStaff: { type: 'boolean' },
+          blockManager: { type: 'boolean' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Check if user is admin
+      const roles = await getUserRoles(app.pg, user.id);
+      const isAdmin = roles.includes('admin');
+
+      if (!isAdmin) {
+        return reply.code(403).send({ message: 'Access denied. Admin role required.' });
+      }
+
+      const { title, message, blockStaff, blockManager } = request.body;
+
+      // Upsert maintenance settings
+      // Note: value column is jsonb, so we need to store values as JSON
+      const settings = [
+        { key: 'maintenance_title', value: title || '' },
+        { key: 'maintenance_message', value: message || '' },
+        { key: 'maintenance_block_staff', value: blockStaff || false },
+        { key: 'maintenance_block_manager', value: blockManager || false },
+      ];
+
+      for (const setting of settings) {
+        // For jsonb, we can store the value directly (PostgreSQL will handle conversion)
+        // For booleans, store as boolean directly in jsonb
+        // For strings, store as string directly in jsonb
+        const jsonbValue = setting.value;
+        
+        // Check if setting exists first
+        const existing = await app.pg.query(
+          `SELECT id FROM public.settings 
+           WHERE key = $1 AND is_system = true AND owner_user_id IS NULL`,
+          [setting.key]
+        );
+
+        // Store the value - use to_jsonb to ensure proper type conversion
+        // This ensures booleans are stored as booleans, not strings
+        request.log.info({ 
+          key: setting.key, 
+          value: jsonbValue, 
+          valueType: typeof jsonbValue,
+          jsonStringified: JSON.stringify(jsonbValue)
+        }, 'Storing maintenance setting');
+        
+        // Store the value directly as jsonb - PostgreSQL will preserve the type
+        // For booleans, we need to ensure they're stored as actual booleans, not strings
+        // Using $1::jsonb directly will parse the JSON string and preserve types
+        if (existing.rows.length > 0) {
+          // Update existing setting - cast JSON string to jsonb (preserves boolean types)
+          await app.pg.query(
+            `UPDATE public.settings 
+             SET value = $1::jsonb, updated_at = now()
+             WHERE key = $2 AND is_system = true AND owner_user_id IS NULL`,
+            [JSON.stringify(jsonbValue), setting.key]
+          );
+        } else {
+          // Insert new setting - cast JSON string to jsonb (preserves boolean types)
+          await app.pg.query(
+            `INSERT INTO public.settings (key, value, is_system, owner_user_id)
+             VALUES ($1, $2::jsonb, true, NULL)`,
+            [setting.key, JSON.stringify(jsonbValue)]
+          );
+        }
+        
+        // Verify what was stored
+        const verify = await app.pg.query(
+          `SELECT value, pg_typeof(value) as value_type 
+           FROM public.settings 
+           WHERE key = $1 AND is_system = true AND owner_user_id IS NULL`,
+          [setting.key]
+        );
+        if (verify.rows.length > 0) {
+          request.log.info({ 
+            key: setting.key,
+            storedValue: verify.rows[0].value,
+            storedType: verify.rows[0].value_type,
+            storedValueType: typeof verify.rows[0].value
+          }, 'Verified stored maintenance setting');
+        }
+      }
+
+      return reply.send({ 
+        success: true,
+        message: 'Maintenance settings updated successfully',
+        settings: {
+          title: title || '',
+          message: message || '',
+          blockStaff: blockStaff || false,
+          blockManager: blockManager || false,
+        }
+      });
+    } catch (error) {
+      request.log.error({ 
+        err: error, 
+        stack: error.stack,
+        message: error.message,
+        code: error.code,
+        detail: error.detail,
+        hint: error.hint
+      }, 'Failed to update maintenance settings');
+      return reply.code(500).send({ 
+        message: 'Failed to update maintenance settings', 
+        error: error.message,
+        detail: error.detail,
+        code: error.code
+      });
+    }
+  });
 }
 
 module.exports = settingsRoutes;

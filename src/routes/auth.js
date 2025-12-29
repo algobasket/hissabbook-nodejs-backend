@@ -64,6 +64,84 @@ async function authRoutes(app) {
       return reply.code(401).send({ message: 'Invalid email or password' });
     }
 
+    // Check maintenance mode settings
+    try {
+      const maintenanceResult = await app.pg.query(
+        `SELECT key, value 
+         FROM public.settings 
+         WHERE key IN ('maintenance_block_staff', 'maintenance_block_manager', 'maintenance_title', 'maintenance_message')
+         AND is_system = true 
+         AND owner_user_id IS NULL`
+      );
+
+      const maintenanceSettings = {
+        blockStaff: false,
+        blockManager: false,
+        title: '',
+        message: '',
+      };
+
+      maintenanceResult.rows.forEach((row) => {
+        // Handle jsonb value - could be string, boolean, number, or object
+        let value = row.value;
+        
+        // If value is stored as jsonb, it might be wrapped
+        if (typeof value === 'string') {
+          try {
+            // Try to parse if it's a JSON string
+            const parsed = JSON.parse(value);
+            value = parsed;
+          } catch {
+            // If parsing fails, use the string as-is
+          }
+        }
+        
+        // Extract value from object if needed
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+          value = value.value !== undefined ? value.value : value;
+        }
+        
+        if (row.key === 'maintenance_block_staff') {
+          // Handle boolean values - check for true, 'true', 1, etc.
+          maintenanceSettings.blockStaff = value === true || value === 'true' || value === 1 || value === '1';
+        } else if (row.key === 'maintenance_block_manager') {
+          // Handle boolean values - check for true, 'true', 1, etc.
+          maintenanceSettings.blockManager = value === true || value === 'true' || value === 1 || value === '1';
+        } else if (row.key === 'maintenance_title') {
+          maintenanceSettings.title = typeof value === 'string' ? value : (value || '');
+        } else if (row.key === 'maintenance_message') {
+          maintenanceSettings.message = typeof value === 'string' ? value : (value || '');
+        }
+      });
+
+      // Get user roles to check if they should be blocked
+      const roles = await getUserRoles(app.pg, user.id);
+      const isAdmin = roles.includes('admin');
+      const isStaff = roles.includes('staff') || roles.includes('agents');
+      const isManager = roles.includes('managers') || roles.includes('manager');
+
+      // Block staff if maintenance mode is enabled for staff (admin can always login)
+      if (!isAdmin && isStaff && maintenanceSettings.blockStaff) {
+        return reply.code(503).send({
+          message: maintenanceSettings.message || 'System is under maintenance. Please try again later.',
+          title: maintenanceSettings.title || 'Maintenance Mode',
+          maintenance: true,
+        });
+      }
+
+      // Block manager if maintenance mode is enabled for managers (admin can always login)
+      if (!isAdmin && isManager && maintenanceSettings.blockManager) {
+        return reply.code(503).send({
+          message: maintenanceSettings.message || 'System is under maintenance. Please try again later.',
+          title: maintenanceSettings.title || 'Maintenance Mode',
+          maintenance: true,
+        });
+      }
+    } catch (error) {
+      // If maintenance check fails, log but don't block login
+      request.log.warn({ err: error }, 'Failed to check maintenance settings during login');
+    }
+
     await app.pg.query(
       'UPDATE public.users SET last_login_at = now(), updated_at = now() WHERE id = $1',
       [user.id],

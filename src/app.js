@@ -141,6 +141,7 @@ async function buildApp() {
   await app.register(require('./routes/settings'), { prefix: '/api' });
   await app.register(subscriptionsRoutes, { prefix: '/api' });
   await app.register(require('./routes/shortUrl'), { prefix: '/api' }); // Register with /api prefix so frontend can call it
+  await app.register(require('./routes/blogPosts'), { prefix: '/api' });
 
   return app;
 }

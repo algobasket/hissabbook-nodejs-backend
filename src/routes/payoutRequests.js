@@ -3,8 +3,9 @@
 
 const fs = require('fs/promises');
 const path = require('path');
-const crypto = require('crypto');
+const { uploadProofToR2, deleteFromR2 } = require('../utils/r2Upload');
 
+// Legacy function for backward compatibility (if R2 is not configured)
 async function saveProofToDisk(base64String) {
   if (!base64String) {
     return null;
@@ -19,6 +20,7 @@ async function saveProofToDisk(base64String) {
   const data = matches[2];
   const buffer = Buffer.from(data, 'base64');
   const extension = mimeType.split('/')[1] || 'bin';
+  const crypto = require('crypto');
   const uniqueId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
   const fileName = `payout-${Date.now()}-${uniqueId}.${extension}`;
   const uploadDir = path.join(process.cwd(), 'uploads');
@@ -26,6 +28,41 @@ async function saveProofToDisk(base64String) {
   const filePath = path.join(uploadDir, fileName);
   await fs.writeFile(filePath, buffer);
   return fileName;
+}
+
+// Upload proof to R2 or fallback to disk
+async function saveProof(base64String) {
+  // Check if R2 is configured
+  const hasR2Config = process.env.R2_ENDPOINT && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY;
+  
+  // Debug logging
+  console.log('=== R2 Upload Check ===');
+  console.log('R2_ENDPOINT:', process.env.R2_ENDPOINT ? 'SET' : 'NOT SET');
+  console.log('R2_ACCESS_KEY_ID:', process.env.R2_ACCESS_KEY_ID ? 'SET' : 'NOT SET');
+  console.log('R2_SECRET_ACCESS_KEY:', process.env.R2_SECRET_ACCESS_KEY ? 'SET' : 'NOT SET');
+  console.log('R2_BUCKET_NAME:', process.env.R2_BUCKET_NAME || 'hissabbook (default)');
+  console.log('R2_PUBLIC_URL:', process.env.R2_PUBLIC_URL || 'NOT SET');
+  console.log('Has R2 Config:', hasR2Config);
+  
+  if (!hasR2Config) {
+    console.warn('⚠️  R2 not configured - missing environment variables. Using disk storage.');
+    console.warn('Required: R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY');
+    return await saveProofToDisk(base64String);
+  }
+  
+  try {
+    console.log('✅ Attempting to upload proof to R2...');
+    const result = await uploadProofToR2(base64String);
+    console.log('✅ Successfully uploaded to R2:', result.url);
+    // Store the R2 URL in proof_filename column
+    return result.url;
+  } catch (error) {
+    // Log detailed error but fallback to disk storage
+    console.error('❌ Failed to upload to R2, falling back to disk storage');
+    console.error('R2 Error:', error.message);
+    console.error('Error stack:', error.stack);
+    return await saveProofToDisk(base64String);
+  }
 }
 
 const { findUserByEmail, getUserRoles, hasPermission } = require('../services/userService');
@@ -56,31 +93,17 @@ async function payoutRequestRoutes(app) {
         return reply.code(404).send({ message: 'User not found' });
       }
 
-      const proofFilename = await saveProofToDisk(proof);
+      // Upload proof to R2 (or fallback to disk if R2 not configured)
+      const proofUrlOrFilename = await saveProof(proof);
       
-      // Verify file was saved and log details for debugging
-      const uploadDir = path.join(process.cwd(), 'uploads');
-      const filePath = path.join(uploadDir, proofFilename);
-      try {
-        const fileStats = await fs.stat(filePath);
-        request.log.info({
-          proofFilename,
-          uploadDir,
-          filePath,
-          cwd: process.cwd(),
-          fileSize: fileStats.size,
-          fileExists: true
-        }, 'Payout proof file saved and verified');
-      } catch (statError) {
-        request.log.error({
-          proofFilename,
-          uploadDir,
-          filePath,
-          cwd: process.cwd(),
-          error: statError.message
-        }, 'Payout proof file save verification failed');
-        // Continue anyway - file might still be accessible
-      }
+      // Log upload details
+      const isR2Url = proofUrlOrFilename && proofUrlOrFilename.startsWith('http');
+      request.log.info({
+        proofUrlOrFilename,
+        storageType: isR2Url ? 'R2' : 'disk',
+        uploaded: true,
+        r2Configured: !!(process.env.R2_ENDPOINT && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY)
+      }, 'Payout proof file uploaded');
 
       // If book_id is provided, verify it exists and belongs to the user
       if (book_id) {
@@ -97,7 +120,7 @@ async function payoutRequestRoutes(app) {
         `INSERT INTO public.payout_requests (user_id, amount, utr, remarks, proof_filename, book_id, status)
          VALUES ($1, $2, $3, $4, $5, $6, 'pending')
          RETURNING id, status, created_at, proof_filename, amount, book_id`,
-        [user.id, amount, utr, remarks, proofFilename, book_id || null],
+        [user.id, amount, utr, remarks, proofUrlOrFilename, book_id || null],
       );
 
       reply.code(201).send({ request: result.rows[0] });
@@ -153,7 +176,12 @@ async function payoutRequestRoutes(app) {
 
       const hasUserId = columnsCheck.rows.length > 0;
 
-      const { status } = request.query;
+      const { status, page, limit } = request.query;
+      
+      // Pagination parameters
+      const pageNum = parseInt(page) || 1;
+      const limitNum = parseInt(limit) || 10;
+      const offset = (pageNum - 1) * limitNum;
 
       let query;
       
@@ -221,6 +249,8 @@ async function payoutRequestRoutes(app) {
 
       const params = [];
       let paramIndex = 1;
+      let countParams = [];
+      let countWhereClause = '';
 
       // For staff users, only show their own payout requests
       if (isStaff && !isAdmin && !isManager) {
@@ -228,9 +258,13 @@ async function payoutRequestRoutes(app) {
           query += ' WHERE pr.user_id = $' + paramIndex;
           params.push(user.id);
           paramIndex++;
+          
+          // Build count query condition
+          countWhereClause = ' WHERE pr.user_id = $1';
+          countParams.push(user.id);
         } else {
           // If user_id column doesn't exist, return empty for staff
-          return reply.send({ payoutRequests: [] });
+          return reply.send({ payoutRequests: [], pagination: { page: pageNum, limit: limitNum, total: 0, totalPages: 0 } });
         }
       }
       // For managers, filter by staff who are members of their books OR staff they created
@@ -267,9 +301,13 @@ async function payoutRequestRoutes(app) {
           query += ' WHERE pr.user_id = ANY($' + paramIndex + '::uuid[])';
           params.push(allStaffUserIds);
           paramIndex++;
+          
+          // Build count query condition
+          countWhereClause = ' WHERE pr.user_id = ANY($1::uuid[])';
+          countParams.push(allStaffUserIds);
         } else {
           // No staff members in manager's books, return empty result
-          return reply.send({ payoutRequests: [] });
+          return reply.send({ payoutRequests: [], pagination: { page: pageNum, limit: limitNum, total: 0, totalPages: 0 } });
         }
       }
 
@@ -281,11 +319,29 @@ async function payoutRequestRoutes(app) {
         }
         params.push(status);
         paramIndex++;
+        
+        // Add to count query
+        if (countWhereClause) {
+          countWhereClause += ' AND pr.status = $' + (countParams.length + 1);
+        } else {
+          countWhereClause = ' WHERE pr.status = $1';
+        }
+        countParams.push(status);
       }
 
-      query += ' ORDER BY pr.created_at DESC';
+      // Get total count for pagination (before ORDER BY and pagination)
+      // Build a simple count query with the same WHERE conditions
+      const countQuery = 'SELECT COUNT(*) as total FROM public.payout_requests pr' + countWhereClause;
+      const countResult = await app.pg.query(countQuery, countParams.length > 0 ? countParams : undefined);
+      const total = parseInt(countResult.rows[0]?.total || 0);
 
-      const result = await app.pg.query(query, params.length > 0 ? params : undefined);
+      // Apply ORDER BY and pagination to main query
+      query += ' ORDER BY pr.created_at DESC';
+      query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+      params.push(limitNum, offset);
+      paramIndex += 2;
+
+      const result = await app.pg.query(query, params);
 
       const payoutRequests = result.rows.map((row) => {
         const fullName = [row.first_name, row.last_name].filter(Boolean).join(' ').trim() || row.user_email?.split('@')[0] || 'Unknown';
@@ -317,7 +373,15 @@ async function payoutRequestRoutes(app) {
         };
       });
 
-      return reply.send({ payoutRequests });
+      return reply.send({ 
+        payoutRequests,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          totalPages: Math.ceil(total / limitNum),
+        }
+      });
     } catch (error) {
       request.log.error({ 
         err: error, 
@@ -334,6 +398,126 @@ async function payoutRequestRoutes(app) {
         error: error.message,
         code: error.code,
         details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+  });
+
+  // Update payout request (edit amount, utr, remarks, proof)
+  // IMPORTANT: This must be registered BEFORE /:id/status to avoid route conflicts
+  app.put('/:id', {
+    preValidation: [app.authenticate],
+    schema: {
+      params: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', format: 'uuid' },
+        },
+      },
+      body: {
+        type: 'object',
+        required: ['amount', 'utr', 'remarks'],
+        properties: {
+          amount: { type: 'number', minimum: 0.01 },
+          utr: { type: 'string', minLength: 4 },
+          remarks: { type: 'string', minLength: 1 },
+          proof: { type: 'string' }, // Optional - only if updating proof
+        },
+      },
+    },
+  }, async (request, reply) => {
+    request.log.info({ method: 'PUT', url: request.url, params: request.params, body: request.body }, 'PUT /:id handler called');
+    try {
+      const user = await findUserByEmail(app.pg, request.user.email);
+      if (!user) {
+        return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Check if user has permission to update payouts
+      const canUpdate = await hasPermission(app.pg, user.id, 'payouts.update');
+      const roles = await getUserRoles(app.pg, user.id);
+      const isAdmin = roles.includes('admin');
+      
+      request.log.info({ userId: user.id, canUpdate, isAdmin }, 'Permission check for payout update');
+      
+      if (!canUpdate && !isAdmin) {
+        return reply.code(403).send({ message: 'Access denied. You do not have permission to update payout requests.' });
+      }
+
+      const { id } = request.params;
+      const { amount, utr, remarks, proof } = request.body;
+
+      // Check if payout request exists
+      const existing = await app.pg.query(
+        `SELECT id, user_id, status, proof_filename, book_id FROM public.payout_requests WHERE id = $1`,
+        [id]
+      );
+
+      if (existing.rows.length === 0) {
+        return reply.code(404).send({ message: 'Payout request not found' });
+      }
+
+      const payoutRequest = existing.rows[0];
+
+      // If proof is provided, upload new proof (to R2 or disk)
+      let proofFilename = payoutRequest.proof_filename;
+      if (proof) {
+        // Delete old proof if it exists
+        if (proofFilename) {
+          const isR2Url = proofFilename.startsWith('http');
+          if (isR2Url) {
+            // Extract key from R2 URL for deletion
+            const urlParts = proofFilename.split('/');
+            const domainIndex = urlParts.findIndex(part => part.includes('r2.dev') || part.includes('r2.cloudflarestorage.com'));
+            if (domainIndex >= 0 && domainIndex < urlParts.length - 1) {
+              const key = urlParts.slice(domainIndex + 1).join('/');
+              await deleteFromR2(key).catch((err) => {
+                request.log.warn({ err, key }, 'Failed to delete old proof from R2');
+              });
+            }
+          } else {
+            // Delete from local disk
+            const fs = require('fs').promises;
+            const path = require('path');
+            const uploadDir = path.join(process.cwd(), 'uploads');
+            const proofPath = path.join(uploadDir, proofFilename);
+            await fs.unlink(proofPath).catch((err) => {
+              request.log.warn({ err, proofPath }, 'Failed to delete old proof from disk');
+            });
+          }
+        }
+
+        // Upload new proof
+        const proofUrlOrFilename = await saveProof(proof);
+        proofFilename = proofUrlOrFilename;
+        
+        request.log.info({
+          proofUrlOrFilename,
+          storageType: proofUrlOrFilename.startsWith('http') ? 'R2' : 'disk',
+        }, 'Updated payout proof file');
+      }
+
+      // Update payout request
+      const result = await app.pg.query(
+        `UPDATE public.payout_requests
+         SET amount = $1, utr = $2, remarks = $3, proof_filename = $4, updated_at = now()
+         WHERE id = $5
+         RETURNING id, amount, utr, remarks, proof_filename, status, created_at, updated_at`,
+        [amount, utr, remarks, proofFilename, id]
+      );
+
+      if (result.rows.length === 0) {
+        return reply.code(404).send({ message: 'Payout request not found or update failed' });
+      }
+
+      return reply.send({ 
+        payoutRequest: result.rows[0],
+        message: 'Payout request updated successfully'
+      });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to update payout request');
+      return reply.code(500).send({
+        message: 'Failed to update payout request',
+        error: error.message
       });
     }
   });
@@ -411,16 +595,32 @@ async function payoutRequestRoutes(app) {
         }
       }
 
-      // Delete proof file if it exists
+      // Delete proof file if it exists (from R2 or disk)
       if (payoutRequest.proof_filename) {
         try {
-          const fs = require('fs').promises;
-          const path = require('path');
-          const uploadDir = path.join(process.cwd(), 'uploads');
-          const proofPath = path.join(uploadDir, payoutRequest.proof_filename);
-          await fs.unlink(proofPath).catch(() => {
-            // File doesn't exist or can't be deleted - that's okay
-          });
+          const isR2Url = payoutRequest.proof_filename.startsWith('http');
+          if (isR2Url) {
+            // Extract key from R2 URL for deletion (includes path like screenshots/filename)
+            // URL format: https://bucket.account.r2.cloudflarestorage.com/screenshots/payout-xxx.jpg
+            const urlParts = payoutRequest.proof_filename.split('/');
+            // Get everything after the bucket/account part (e.g., screenshots/payout-xxx.jpg)
+            const bucketIndex = urlParts.findIndex(part => part.includes('r2.cloudflarestorage.com'));
+            if (bucketIndex >= 0 && bucketIndex < urlParts.length - 1) {
+              const key = urlParts.slice(bucketIndex + 1).join('/'); // e.g., screenshots/payout-xxx.jpg
+              await deleteFromR2(key).catch(() => {
+                // File doesn't exist or can't be deleted - that's okay
+              });
+            }
+          } else {
+            // Delete from local disk
+            const fs = require('fs').promises;
+            const path = require('path');
+            const uploadDir = path.join(process.cwd(), 'uploads');
+            const proofPath = path.join(uploadDir, payoutRequest.proof_filename);
+            await fs.unlink(proofPath).catch(() => {
+              // File doesn't exist or can't be deleted - that's okay
+            });
+          }
         } catch (fileError) {
           request.log.warn({ err: fileError }, 'Failed to delete payout request proof file');
         }
@@ -773,39 +973,50 @@ async function payoutRequestRoutes(app) {
               // Link the proof file from payout request to the entry attachment if it exists
               if (payoutRequest.proof_filename) {
                 try {
-                    const uploadDir = path.join(process.cwd(), 'uploads');
-                    const proofPath = path.join(uploadDir, payoutRequest.proof_filename);
+                    const isR2Url = payoutRequest.proof_filename.startsWith('http');
                     
                     request.log.info({
                       entry_id: entryId,
                       proof_filename: payoutRequest.proof_filename,
-                      proof_path: proofPath,
-                      upload_dir: uploadDir,
+                      storage_type: isR2Url ? 'R2' : 'disk',
                     }, 'Attempting to link payout proof file to cash-out entry');
                     
-                    // Check if file exists and get file stats
-                    let fileStats;
+                    // For R2 URLs, we don't need to check file existence locally
+                    // For disk files, check if file exists and get file stats
+                    let fileStats = null;
                     let fileExists = false;
-                    try {
-                      fileStats = await fs.stat(proofPath);
+                    
+                    if (!isR2Url) {
+                      try {
+                        const uploadDir = path.join(process.cwd(), 'uploads');
+                        const proofPath = path.join(uploadDir, payoutRequest.proof_filename);
+                        fileStats = await fs.stat(proofPath);
+                        fileExists = true;
+                        request.log.info({
+                          proof_path: proofPath,
+                          file_size: fileStats.size,
+                          file_exists: true,
+                        }, 'Proof file found on disk');
+                      } catch (err) {
+                        request.log.warn({ 
+                          proof_filename: payoutRequest.proof_filename,
+                          error: err.message,
+                          error_code: err.code,
+                        }, 'Proof file not found on disk, will create attachment record anyway');
+                        fileStats = null;
+                        fileExists = false;
+                      }
+                    } else {
+                      // For R2 URLs, assume file exists (it was just uploaded)
                       fileExists = true;
-                      request.log.info({
-                        proof_path: proofPath,
-                        file_size: fileStats.size,
-                        file_exists: true,
-                      }, 'Proof file found');
-                    } catch (err) {
-                      request.log.warn({ 
-                        proof_path: proofPath,
-                        error: err.message,
-                        error_code: err.code,
-                      }, 'Proof file not found at expected path, will create attachment record anyway');
-                      fileStats = null;
-                      fileExists = false;
                     }
 
-                    // Determine file type and mime type from filename
-                    const fileNameParts = payoutRequest.proof_filename.split('.');
+                    // Determine file type and mime type from filename or URL
+                    // Extract just the filename (for file_name) and keep full URL/path (for file_path)
+                    const fileName = isR2Url 
+                      ? payoutRequest.proof_filename.split('/').pop() 
+                      : payoutRequest.proof_filename;
+                    const fileNameParts = fileName.split('.');
                     const fileExtension = (fileNameParts.length > 1 ? fileNameParts.pop() : '').toLowerCase();
                     const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(fileExtension);
                     const isPdf = fileExtension === 'pdf';
@@ -826,9 +1037,11 @@ async function payoutRequestRoutes(app) {
                     // Use file size from stats if available, otherwise use 0
                     const fileSize = fileStats ? fileStats.size : 0;
                     
-                    // Store just the filename in file_path (not full system path)
-                    // The API will construct the URL as /uploads/${filename}
-                    const filePathForDb = payoutRequest.proof_filename;
+                    // Store the URL (for R2) or filename (for disk) in file_path
+                    // For R2 URLs, store the full URL; for disk files, store just the filename
+                    // For file_name, always store just the filename (extracted from URL if needed)
+                    const filePathForDb = payoutRequest.proof_filename; // Full R2 URL or local filename
+                    const fileNameForDb = fileName; // Just the filename
                     
                     const attachmentResult = await client.query(
                       `INSERT INTO public.entry_attachments (
@@ -839,8 +1052,8 @@ async function payoutRequestRoutes(app) {
                       [
                         entryId,
                         targetBookId,
-                        payoutRequest.proof_filename,
-                        filePathForDb, // Store just filename, not full path
+                        fileNameForDb, // Store just the filename
+                        filePathForDb, // Store full R2 URL or local filename
                         fileType,
                         fileSize,
                         mimeType,

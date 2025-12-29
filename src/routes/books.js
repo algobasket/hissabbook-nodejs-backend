@@ -3,6 +3,7 @@
 
 const { findUserByEmail, getUserRoles, hasPermission } = require('../services/userService');
 const { saveFileToDisk, deleteFileFromDisk } = require('../utils/fileUpload');
+const { uploadAttachmentToR2, deleteFromR2 } = require('../utils/r2Upload');
 const fs = require('fs/promises');
 const path = require('path');
 
@@ -786,8 +787,31 @@ async function booksRoutes(app) {
         }
       }
 
-      // Save file to disk
-      const fileInfo = await saveFileToDisk(file, 'bill');
+      // Upload file to R2 (or fallback to disk if R2 not configured)
+      const hasR2Config = process.env.R2_ENDPOINT && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY;
+      
+      let fileInfo;
+      if (hasR2Config) {
+        try {
+          request.log.info('Attempting to upload attachment to R2...');
+          const r2Result = await uploadAttachmentToR2(file);
+          fileInfo = {
+            fileName: r2Result.fileName.split('/').pop(), // Extract just filename for file_name
+            filePath: r2Result.url, // Store full R2 URL in file_path
+            fileType: r2Result.mimeType.startsWith('image/') ? 'image' : (r2Result.mimeType === 'application/pdf' ? 'pdf' : 'document'),
+            fileSize: r2Result.fileSize,
+            mimeType: r2Result.mimeType,
+          };
+          request.log.info({ url: r2Result.url }, 'Successfully uploaded attachment to R2');
+        } catch (r2Error) {
+          request.log.error({ err: r2Error }, 'Failed to upload attachment to R2, falling back to disk storage');
+          // Fallback to disk storage
+          fileInfo = await saveFileToDisk(file, 'bill');
+        }
+      } else {
+        request.log.info('R2 not configured, using disk storage for attachment');
+        fileInfo = await saveFileToDisk(file, 'bill');
+      }
 
       // Store file reference in database (entry_id will be set when entry is created)
       const result = await app.pg.query(
@@ -894,18 +918,66 @@ async function booksRoutes(app) {
         }
       }
 
+      // For attachments with payout-related filenames, try to get R2 URL from payout_requests
+      // This handles cases where entry_attachments.file_path still has old filename format
+      const attachmentIds = attachmentsResult.rows.map(row => row.id);
+      let payoutR2Urls = {};
+      
+      if (attachmentIds.length > 0) {
+        try {
+          // Find entries linked to payout requests and get R2 URLs
+          const payoutQuery = `
+            SELECT DISTINCT
+              ea.id as attachment_id,
+              pr.proof_filename as r2_url
+            FROM public.entry_attachments ea
+            INNER JOIN public.entries e ON ea.entry_id = e.id
+            INNER JOIN public.payout_requests pr ON e.remarks LIKE '%Payout Request: ' || pr.id::text || '%'
+            WHERE 
+              ea.id = ANY($1)
+              AND ea.file_path LIKE 'payout-%'
+              AND pr.proof_filename LIKE 'http%'
+              AND ea.file_path != pr.proof_filename;
+          `;
+          const payoutResult = await app.pg.query(payoutQuery, [attachmentIds]);
+          payoutR2Urls = payoutResult.rows.reduce((acc, row) => {
+            acc[row.attachment_id] = row.r2_url;
+            return acc;
+          }, {});
+        } catch (err) {
+          request.log.warn({ err }, 'Failed to fetch R2 URLs from payout_requests, continuing with file_path');
+        }
+      }
+
       const attachments = attachmentsResult.rows.map((row) => {
-        // Extract just the filename from file_path if it's a full path
-        const fileName = row.file_path.includes('/') 
-          ? row.file_path.split('/').pop() 
-          : row.file_name;
+        // Check if file_path is already a full URL (R2 URL)
+        const isR2Url = row.file_path && (row.file_path.startsWith('http://') || row.file_path.startsWith('https://'));
+        
+        // Check if we have an R2 URL from payout_requests for this attachment
+        const r2UrlFromPayout = payoutR2Urls[row.id];
+        
+        // Construct URL - prioritize R2 URL from payout_requests, then file_path, then construct local URL
+        let fileUrl;
+        if (r2UrlFromPayout) {
+          // Use R2 URL from payout_requests (for old entries that weren't updated)
+          fileUrl = r2UrlFromPayout;
+        } else if (isR2Url) {
+          // It's an R2 URL in file_path, use it directly
+          fileUrl = row.file_path;
+        } else {
+          // It's a local filename, construct the local URL
+          const fileName = row.file_path.includes('/') 
+            ? row.file_path.split('/').pop() 
+            : row.file_name;
+          fileUrl = `/uploads/${fileName}`;
+        }
         
         return {
           id: row.id,
           file_name: row.file_name,
           file_path: row.file_path,
           path: row.file_path, // Alias for compatibility
-          url: `/uploads/${fileName}`, // Construct URL for serving files
+          url: fileUrl, // Use R2 URL if available, otherwise construct local URL
           file_type: row.file_type,
           mime_type: row.mime_type,
           type: row.mime_type, // Alias for compatibility
@@ -948,7 +1020,7 @@ async function booksRoutes(app) {
 
       // Verify attachment exists and belongs to the book
       const attachmentResult = await app.pg.query(
-        `SELECT id, file_name, book_id
+        `SELECT id, file_name, file_path, book_id
          FROM public.entry_attachments
          WHERE id = $1 AND book_id = $2`,
         [attachmentId, bookId]
@@ -960,8 +1032,33 @@ async function booksRoutes(app) {
 
       const attachment = attachmentResult.rows[0];
 
-      // Delete file from disk
-      await deleteFileFromDisk(attachment.file_name);
+      // Delete file from storage (R2 or disk)
+      try {
+        const filePath = attachment.file_path || attachment.file_name;
+        const isR2Url = filePath && (filePath.startsWith('http://') || filePath.startsWith('https://'));
+        
+        if (isR2Url) {
+          // Extract key from R2 URL for deletion
+          // URL format: https://bucket.account.r2.dev/screenshots/bill-xxx.jpg
+          // or: https://pub-xxx.r2.dev/screenshots/bill-xxx.jpg
+          const urlParts = filePath.split('/');
+          // Find the part after the domain (e.g., screenshots/bill-xxx.jpg)
+          const domainIndex = urlParts.findIndex(part => part.includes('r2.dev') || part.includes('r2.cloudflarestorage.com'));
+          if (domainIndex >= 0 && domainIndex < urlParts.length - 1) {
+            const key = urlParts.slice(domainIndex + 1).join('/'); // e.g., screenshots/bill-xxx.jpg
+            await deleteFromR2(key).catch((err) => {
+              request.log.warn({ err, key }, 'Failed to delete file from R2, continuing with database deletion');
+            });
+          }
+        } else {
+          // Delete from local disk
+          await deleteFileFromDisk(attachment.file_name).catch((err) => {
+            request.log.warn({ err, fileName: attachment.file_name }, 'Failed to delete file from disk, continuing with database deletion');
+          });
+        }
+      } catch (fileError) {
+        request.log.warn({ err: fileError }, 'Error deleting attachment file, continuing with database deletion');
+      }
 
       // Delete from database
       await app.pg.query(
