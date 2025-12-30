@@ -970,6 +970,12 @@ async function payoutRequestRoutes(app) {
 
               const entryId = entryResult.rows[0].id;
 
+              // Update book's updated_at timestamp when entry is created from payout request
+              await client.query(
+                `UPDATE public.books SET updated_at = now() WHERE id = $1`,
+                [targetBookId]
+              );
+
               // Link the proof file from payout request to the entry attachment if it exists
               if (payoutRequest.proof_filename) {
                 try {

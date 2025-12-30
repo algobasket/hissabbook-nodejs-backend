@@ -1305,6 +1305,12 @@ async function booksRoutes(app) {
 
       const entry = entryResult.rows[0];
 
+      // Update book's updated_at timestamp when entry is created
+      await app.pg.query(
+        `UPDATE public.books SET updated_at = now() WHERE id = $1`,
+        [bookId]
+      );
+
       // Update attachment entry_ids if provided
       if (attachmentIds && attachmentIds.length > 0) {
         try {
@@ -1454,6 +1460,12 @@ async function booksRoutes(app) {
 
       const entry = entryResult.rows[0];
 
+      // Update book's updated_at timestamp when entry is updated
+      await app.pg.query(
+        `UPDATE public.books SET updated_at = now() WHERE id = $1`,
+        [bookId]
+      );
+
       // First, unlink all existing attachments for this entry
       await app.pg.query(
         `UPDATE public.entry_attachments
@@ -1528,6 +1540,12 @@ async function booksRoutes(app) {
       await app.pg.query(
         'DELETE FROM public.entries WHERE id = $1 AND book_id = $2',
         [entryId, bookId]
+      );
+
+      // Update book's updated_at timestamp when entry is deleted
+      await app.pg.query(
+        `UPDATE public.books SET updated_at = now() WHERE id = $1`,
+        [bookId]
       );
 
       return reply.send({ 

@@ -43,3 +43,4 @@ if (allConfigured) {
   console.log('2. Restart the backend server');
   console.log('\nSee R2_SETUP.md for detailed instructions.');
 }
+

@@ -104,3 +104,4 @@ updateAttachmentR2Urls()
     console.error('\n💥 Migration failed:', error);
     process.exit(1);
   });
+

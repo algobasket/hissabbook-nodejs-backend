@@ -128,3 +128,4 @@ npm start
 - Consider using IAM-like permissions for production
 - Enable bucket versioning for important files
 - Set up lifecycle policies to manage old files
+
