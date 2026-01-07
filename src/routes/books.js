@@ -1643,6 +1643,7 @@ async function booksRoutes(app) {
             u.email as created_by_email,
             ud.first_name as created_by_first_name,
             ud.last_name as created_by_last_name,
+            pr.created_at as payout_request_created_at,
             SUM(
               CASE 
                 WHEN e.entry_type = 'cash_in' THEN e.amount
@@ -1657,6 +1658,7 @@ async function booksRoutes(app) {
           FROM public.entries e
           LEFT JOIN public.users u ON e.created_by = u.id
           LEFT JOIN public.user_details ud ON u.id = ud.user_id
+          LEFT JOIN public.payout_requests pr ON e.remarks LIKE 'Payout Request: ' || pr.utr || ' -%'
           WHERE e.book_id = $1
         ),
         filtered_entries AS (
@@ -1733,6 +1735,7 @@ async function booksRoutes(app) {
           entry_date,
           entry_time,
           created_at,
+          payout_request_created_at,
           created_by,
           created_by_email,
           created_by_first_name,
