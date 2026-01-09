@@ -68,6 +68,29 @@ async function saveProof(base64String) {
 const { findUserByEmail, getUserRoles, hasPermission } = require('../services/userService');
 
 async function payoutRequestRoutes(app) {
+  // Check if UTR exists
+  app.get('/check-utr/:utr', {
+    preValidation: [app.authenticate],
+  }, async (request, reply) => {
+    const { utr } = request.params;
+
+    try {
+      const result = await app.pg.query(
+        'SELECT id FROM public.payout_requests WHERE utr = $1 LIMIT 1',
+        [utr],
+      );
+
+      if (result.rows.length > 0) {
+        return reply.send({ exists: true });
+      }
+
+      return reply.send({ exists: false });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to check UTR');
+      reply.code(500).send({ message: 'Failed to check UTR' });
+    }
+  });
+
   // Create payout request
   app.post('/', {
     preValidation: [app.authenticate],
@@ -91,6 +114,16 @@ async function payoutRequestRoutes(app) {
       const user = await findUserByEmail(app.pg, request.user.email);
       if (!user) {
         return reply.code(404).send({ message: 'User not found' });
+      }
+
+      // Check if UTR already exists
+      const utrCheck = await app.pg.query(
+        'SELECT id FROM public.payout_requests WHERE utr = $1 LIMIT 1',
+        [utr],
+      );
+
+      if (utrCheck.rows.length > 0) {
+        return reply.code(400).send({ message: 'UTR already existed in our record' });
       }
 
       // Upload proof to R2 (or fallback to disk if R2 not configured)

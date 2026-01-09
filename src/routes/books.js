@@ -1742,7 +1742,7 @@ async function booksRoutes(app) {
           created_by_last_name,
           balance
         FROM filtered_entries
-        ORDER BY entry_date DESC, entry_time DESC, created_at DESC
+        ORDER BY (entry_date + entry_time)::timestamp DESC, created_at DESC
         LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
       queryParams.push(parseInt(limit), parseInt(offset));
 
@@ -2636,15 +2636,15 @@ async function booksRoutes(app) {
 
       // Apply filter type grouping
       if (filterType === 'day') {
-        query += ` ORDER BY e.entry_date DESC, e.entry_time DESC`;
+        query += ` ORDER BY (e.entry_date + e.entry_time)::timestamp DESC`;
       } else if (filterType === 'party') {
-        query += ` ORDER BY e.party_name, e.entry_date DESC, e.entry_time DESC`;
+        query += ` ORDER BY e.party_name, (e.entry_date + e.entry_time)::timestamp DESC`;
       } else if (filterType === 'category') {
-        query += ` ORDER BY e.category_name, e.entry_date DESC, e.entry_time DESC`;
+        query += ` ORDER BY e.category_name, (e.entry_date + e.entry_time)::timestamp DESC`;
       } else if (filterType === 'payment_mode') {
-        query += ` ORDER BY e.payment_mode, e.entry_date DESC, e.entry_time DESC`;
+        query += ` ORDER BY e.payment_mode, (e.entry_date + e.entry_time)::timestamp DESC`;
       } else {
-        query += ` ORDER BY e.entry_date DESC, e.entry_time DESC`;
+        query += ` ORDER BY (e.entry_date + e.entry_time)::timestamp DESC`;
       }
 
       // First, get ALL entries for the book (no filters) to calculate running balance correctly

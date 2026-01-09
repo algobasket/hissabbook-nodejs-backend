@@ -13,8 +13,9 @@ RUN npm config set fetch-timeout 300000 && \
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies with increased timeout and retries
-RUN npm ci --only=production --prefer-offline --no-audit || \
+# Install dependencies with BuildKit cache mount for faster rebuilds
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --only=production --prefer-offline --no-audit || \
     (npm cache clean --force && npm ci --only=production --prefer-offline --no-audit)
 
 # Copy source code
